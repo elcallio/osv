@@ -858,52 +858,62 @@ def all_traces():
     gdb.lookup_global_symbol('gdb_trace_function_entry')
 
     inf = gdb.selected_inferior()
-    trace_log = gdb.lookup_global_symbol('trace_log').value()
-    if not trace_log:
-    	return
     max_trace = ulong(gdb.parse_and_eval('max_trace'))
-    trace_log = inf.read_memory(trace_log, max_trace)
     trace_page_size = ulong(gdb.parse_and_eval('trace_page_size'))
-    last = ulong(gdb.lookup_global_symbol('trace_record_last').value()['_M_i'])
-    last %= max_trace
-    pivot = align_up(last, trace_page_size)
-    trace_log = concat(trace_log[pivot:], trace_log[:pivot])
-    last += max_trace - pivot
-
     tp_ptr = gdb.lookup_type('tracepoint_base').pointer()
     backtrace_len = ulong(gdb.parse_and_eval('tracepoint_base::backtrace_len'))
     tracepoints = {}
+    
+    trace_buffers_in_use = gdb.lookup_global_symbol('trace_buffers_in_use').value()
 
-    i = 0
-    while i < last:
-        tp_key, = struct.unpack('Q', trace_log[i:i+8])
-        if tp_key == 0:
-            i = align_up(i + 8, trace_page_size)
+    while trace_buffers_in_use:
+        trace_log = trace_buffers_in_use['base']
+        last = ulong(trace_buffers_in_use['last'])        
+        
+        trace_buffers_in_use = trace_buffers_in_use['next']        
+        
+        if not trace_log:
             continue
+        
+        trace_log = inf.read_memory(trace_log, max_trace)        
+        
+        last %= max_trace
+        pivot = align_up(last, trace_page_size)
+        trace_log = concat(trace_log[pivot:], trace_log[:pivot])
+        last += max_trace - pivot
 
-        i += 8
-
-        thread, thread_name, time, cpu, flags = struct.unpack('Q16sQII', trace_log[i:i+40])
-        thread_name = thread_name.partition(b'\0')[0].decode()
-        i += 40
-
-        tp = tracepoints.get(tp_key, None)
-        if not tp:
-            tp_ref = gdb.Value(tp_key).cast(tp_ptr)
-            tp = TracePoint(tp_key, str(tp_ref["name"].string()),
-                sig_to_string(ulong(tp_ref['sig'])), str(tp_ref["format"].string()))
-            tracepoints[tp_key] = tp
-
-        backtrace = None
-        if flags & 1:
-            backtrace = struct.unpack('Q' * backtrace_len, trace_log[i:i+8*backtrace_len])
-            i += 8 * backtrace_len
-
-        size = struct.calcsize(tp.signature)
-        data = struct.unpack(tp.signature, trace_log[i:i+size])
-        i += size
-        i = align_up(i, 8)
-        yield Trace(tp, thread, thread_name, time, cpu, data, backtrace=backtrace)
+        continue
+    
+        i = 0
+        while i < last:
+            tp_key, = struct.unpack('Q', trace_log[i:i+8])
+            if tp_key == 0:
+                i = align_up(i + 8, trace_page_size)
+                continue
+                
+            i += 8
+    
+            thread, thread_name, time, cpu, flags = struct.unpack('Q16sQII', trace_log[i:i+40])
+            thread_name = thread_name.partition(b'\0')[0].decode()
+            i += 40
+    
+            tp = tracepoints.get(tp_key, None)
+            if not tp:
+                tp_ref = gdb.Value(tp_key).cast(tp_ptr)
+                tp = TracePoint(tp_key, str(tp_ref["name"].string()),
+                    sig_to_string(ulong(tp_ref['sig'])), str(tp_ref["format"].string()))
+                tracepoints[tp_key] = tp
+    
+            backtrace = None
+            if flags & 1:
+                backtrace = struct.unpack('Q' * backtrace_len, trace_log[i:i+8*backtrace_len])
+                i += 8 * backtrace_len
+    
+            size = struct.calcsize(tp.signature)
+            data = struct.unpack(tp.signature, trace_log[i:i+size])
+            i += size
+            i = align_up(i, 8)
+            yield Trace(tp, thread, thread_name, time, cpu, data, backtrace=backtrace)
 
 def save_traces_to_file(filename):
     trace.write_to_file(filename, list(all_traces()))

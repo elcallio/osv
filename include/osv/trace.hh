@@ -341,7 +341,7 @@ public:
         serialize(buffer, as);
     }
     void serialize(void* buffer, std::tuple<s_args...> as) {
-        return serializer<0, sizeof...(s_args), s_args...>::write(buffer, 0, as);
+        serializer<0, sizeof...(s_args), s_args...>::write(buffer, 0, as);
     }
     size_t size() {
         return base_size() + serializer<0, sizeof...(s_args), s_args...>::size(0);

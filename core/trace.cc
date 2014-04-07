@@ -15,6 +15,7 @@
 #include <osv/debug.hh>
 #include <osv/prio.hh>
 #include <osv/execinfo.hh>
+#include <osv/percpu.hh>
 
 using namespace std;
 
@@ -47,8 +48,66 @@ tracepoint_patch_sites_type tracepoint_patch_sites;
 constexpr size_t trace_page_size = 4096;  // need not match arch page size
 constexpr unsigned max_trace = trace_page_size * 1024;
 
-char *trace_log __attribute__((may_alias));
-std::atomic<size_t> trace_record_last;
+// Having a struct is more complex than it need be for just per-vcpu buffers,
+// _but_ it is in line with later on having rotating buffers, thus wwhy not do it already
+struct trace_buf {
+    // for gdb script, to easily go through
+    const trace_buf * next;
+    char * base __attribute__((may_alias));
+    size_t last;
+
+    trace_buf() :
+            next(nullptr), base(nullptr), last(0) {
+    }
+    trace_buf(const trace_buf * nb) :
+            next(nb), base(
+                    static_cast<char*>(aligned_alloc(sizeof(long), max_trace))), last(
+                    0)
+    {
+        bzero(base, max_trace);;
+    }
+    trace_buf(const trace_buf&) = delete;
+    trace_buf(trace_buf && buf) {
+        *this = std::move(buf);
+    }
+    ~trace_buf() {
+        // base should really be a unique_ptr, but doing this manually
+        // makes it easier to keep the gdb trace extraction working.
+        // When traces are managed through wire API instead, this should be
+        // replaced.
+        delete base;
+    }
+    trace_buf & operator=(const trace_buf&) = delete;
+    trace_buf & operator=(trace_buf && buf) {
+        std::swap(this->base, buf.base);
+        std::swap(this->last, buf.last);
+        std::swap(this->next, buf.next);
+        return *this;
+    }
+
+    // keeping more or less the exact same logging buffer logic as before
+    // to avoid messing with the extraction
+    trace_record * allocate_trace_record(size_t size) {
+        size += sizeof(trace_record);
+        size = align_up(size, sizeof(long));
+        size_t p = last;
+        size_t pn = p + size;
+        if (align_down(p, trace_page_size) != align_down(pn, trace_page_size)) {
+            // crossed page boundary
+            pn = align_up(p, trace_page_size) + size;
+        }
+        char * const pp = &base[p % max_trace];
+        // clear the first word, do indicate an padding at the end of the page
+        reinterpret_cast<trace_record*>(pp)->tp = nullptr;
+        last = pn;
+        return reinterpret_cast<trace_record*>(&base[(pn - size) % max_trace]);
+
+    }
+};
+
+PERCPU(trace_buf, trace_buffer);
+// for gdb. just walk through the single link list. not pretty, but easy.
+trace_buf * trace_buffers_in_use = nullptr;
 bool trace_enabled;
 
 typeof(tracepoint_base::tp_list) tracepoint_base::tp_list __attribute__((init_priority((int)init_prio::tracepoint_base)));
@@ -62,9 +121,15 @@ void enable_trace()
 
 void enable_tracepoint(std::string wildcard)
 {
-    if (!trace_log) {
-        trace_log = (char *) aligned_alloc(sizeof(long), max_trace);
-        bzero(trace_log, max_trace);
+    static bool buffers_initialized;
+
+    if (!buffers_initialized) {
+        for (auto c : sched::cpus) {
+            auto * tbp = trace_buffer.for_cpu(c);
+            *tbp = trace_buf(trace_buffers_in_use);
+            trace_buffers_in_use = tbp;
+        }
+        buffers_initialized = true;
     }
     wildcard = boost::algorithm::replace_all_copy(wildcard, std::string("*"), std::string(".*"));
     wildcard = boost::algorithm::replace_all_copy(wildcard, std::string("?"), std::string("."));
@@ -237,22 +302,7 @@ void tracepoint_base::do_log_backtrace(trace_record* tr, u8*& buffer)
 
 trace_record* allocate_trace_record(size_t size)
 {
-    size += sizeof(trace_record);
-    size = align_up(size, sizeof(long));
-    size_t p = trace_record_last.load(std::memory_order_relaxed);
-    size_t pn;
-    do {
-        pn = p + size;
-        if (align_down(p, trace_page_size) != align_down(pn, trace_page_size)) {
-            // crossed page boundary
-            pn = align_up(p, trace_page_size) + size;
-        }
-    } while (!trace_record_last.compare_exchange_weak(p, pn, std::memory_order_relaxed));
-    char* pp = &trace_log[p % max_trace];
-    // clear the first word, do indicate an padding at the end of the page
-    reinterpret_cast<trace_record*>(pp)->tp = nullptr;
-    pn -= size;
-    return reinterpret_cast<trace_record*>(&trace_log[pn % max_trace]);
+    return trace_buffer->allocate_trace_record(size);
 }
 
 static __thread unsigned func_trace_nesting;
