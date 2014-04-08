@@ -34,7 +34,7 @@ yum install ant autoconf automake boost-static gcc-c++ genromfs libvirt libtool 
 **Debian**
 
 ```
-apt-get install build-essential libboost-all-dev genromfs autoconf libtool openjdk-7-jdk ant qemu-utils maven maven-shade-plugin
+apt-get install build-essential libboost-all-dev genromfs autoconf libtool openjdk-7-jdk ant qemu-utils maven libmaven-shade-plugin-java
 ```
 
 **Ubuntu users**: you may use [Oracle JDK][] if you don't want to pull too many
@@ -48,7 +48,7 @@ the first version to fully comply with the C++11 standard.
 Make sure all git submodules are up-to-date:
 
 ```
-git submodule update --init
+git submodule update --init --recursive
 ```
 
 Finally, build everything at once:
@@ -69,7 +69,7 @@ make img_format=raw
 ./scripts/run.py
 ```
 
-By default, this runs OSv under KVM, with 4 VCPUs and 1GB of memory,
+By default, this runs OSv under KVM, with 4 VCPUs and 2GB of memory,
 and runs the default management application (containing a shell, Web
 server, and SSH server).
 

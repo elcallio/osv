@@ -121,6 +121,24 @@ phys virt_to_phys(void *virt)
     return static_cast<char*>(virt) - phys_mem;
 }
 
+void* mmupage::vaddr() const
+{
+    return _page;
+}
+
+phys mmupage::paddr() const
+{
+    if (!_page) {
+        throw std::exception();
+    }
+    return virt_to_phys(_page);
+}
+
+bool mmupage::cow() const
+{
+    return _cow;
+}
+
 phys allocate_intermediate_level()
 {
     phys pt_page = virt_to_phys(memory::alloc_page());
@@ -173,10 +191,10 @@ void split_large_page(hw_ptep ptep, unsigned level)
 }
 
 struct page_allocator {
-    virtual void* alloc(uintptr_t offset) = 0;
-    virtual void* alloc(size_t size, uintptr_t offset) = 0;
-    virtual void free(void *addr, uintptr_t offset) = 0;
-    virtual void free(void *addr, size_t size, uintptr_t offset) = 0;
+    virtual mmupage alloc(uintptr_t offset, hw_ptep ptep, bool write) = 0;
+    virtual mmupage alloc(size_t size, uintptr_t offset, hw_ptep ptep, bool write) = 0;
+    virtual void free(void *addr, uintptr_t offset, hw_ptep ptep) = 0;
+    virtual void free(void *addr, size_t size, uintptr_t offset, hw_ptep ptep) = 0;
     virtual void finalize() = 0;
     virtual ~page_allocator() {}
 };
@@ -210,13 +228,13 @@ void tlb_flush_this_processor()
 // correctness so that, for example, after mprotect() returns, no thread on
 // no cpu can write to the protected page.
 mutex tlb_flush_mutex;
-sched::thread *tlb_flush_waiter;
+sched::thread_handle tlb_flush_waiter;
 std::atomic<int> tlb_flush_pendingconfirms;
 
 inter_processor_interrupt tlb_flush_ipi{[] {
         tlb_flush_this_processor();
         if (tlb_flush_pendingconfirms.fetch_add(-1) == 1) {
-            tlb_flush_waiter->wake();
+            tlb_flush_waiter.wake();
         }
 }};
 
@@ -226,12 +244,13 @@ void tlb_flush()
     if (sched::cpus.size() <= 1)
         return;
     std::lock_guard<mutex> guard(tlb_flush_mutex);
-    tlb_flush_waiter = sched::thread::current();
+    tlb_flush_waiter.reset(*sched::thread::current());
     tlb_flush_pendingconfirms.store((int)sched::cpus.size() - 1);
     tlb_flush_ipi.send_allbutself();
     sched::thread::wait_until([] {
             return tlb_flush_pendingconfirms.load() == 0;
     });
+    tlb_flush_waiter.clear();
 }
 
 void clamp(uintptr_t& vstart1, uintptr_t& vend1,
@@ -289,6 +308,7 @@ public:
     bool descend(void) { return opt2bool(Descend); }
     bool once(void) { return opt2bool(Once); }
     bool split_large(hw_ptep ptep, int level) { return opt2bool(Split); }
+    int nr_page_sizes(void) { return mmu::nr_page_sizes; }
 
     // small_page() function is called on level 0 ptes. Each page table operation
     // have to provide its own version.
@@ -389,7 +409,7 @@ private:
             hw_ptep ptep = pt.at(idx);
             uintptr_t vstart1 = vcur, vend1 = vend;
             clamp(vstart1, vend1, base_virt, base_virt + step - 1, slop);
-            if (unsigned(level) < nr_page_sizes && vstart1 == base_virt && vend1 == base_virt + step - 1) {
+            if (unsigned(level) < page_mapper.nr_page_sizes() && vstart1 == base_virt && vend1 == base_virt + step - 1) {
                 uintptr_t offset = base_virt - vma_start;
                 if (level) {
                     if (!skip_pte(ptep)) {
@@ -462,44 +482,72 @@ template <account_opt T = account_opt::no>
 class populate : public vma_operation<allocate_intermediate_opt::yes, skip_empty_opt::no, T> {
 private:
     page_allocator* _page_provider;
-    unsigned int perm;
+    unsigned int _perm;
+    bool _write;
     bool _map_dirty;
     pt_element dirty(pt_element pte) {
         pte.set_dirty(_map_dirty);
         return pte;
     }
+    bool skip(pt_element pte) {
+        if (pte.empty()) {
+            return false;
+        }
+        return !_write || pte.writable();
+    }
+    unsigned int perm(bool cow) {
+        unsigned int p = _perm;
+        if (cow) {
+            p &= ~perm_write;
+        }
+        return p;
+    }
 public:
-    populate(page_allocator* pops, unsigned int perm, bool map_dirty = true) :
-        _page_provider(pops), perm(perm), _map_dirty(map_dirty) { }
+    populate(page_allocator* pops, unsigned int perm, bool write = false, bool map_dirty = true) :
+        _page_provider(pops), _perm(perm), _write(write), _map_dirty(map_dirty) { }
     void small_page(hw_ptep ptep, uintptr_t offset){
-        if (!ptep.read().empty()) {
+        pt_element pte = ptep.read();
+        if (skip(pte)) {
             return;
         }
-        phys page = virt_to_phys(_page_provider->alloc(offset));
-        if (!ptep.compare_exchange(make_empty_pte(), dirty(make_normal_pte(page, perm)))) {
-            _page_provider->free(phys_to_virt(page), offset);
+        mmupage page = _page_provider->alloc(offset, ptep, _write);
+        if (!ptep.compare_exchange(pte, dirty(make_normal_pte(page.paddr(), perm(page.cow()))))) {
+            _page_provider->free(page.vaddr(), offset, ptep);
         } else {
             this->account(mmu::page_size);
         }
     }
     bool huge_page(hw_ptep ptep, uintptr_t offset){
-        auto pte = ptep.read();
-        if (!pte.empty()) {
+        pt_element pte = ptep.read();
+        if (skip(pte)) {
             return true;
         }
-        void *vpage = _page_provider->alloc(huge_page_size, offset);
-        if (!vpage) {
-            return false;
-        }
 
-        phys page = virt_to_phys(vpage);
-        if (!ptep.compare_exchange(make_empty_pte(), dirty(make_large_pte(page, perm)))) {
-            _page_provider->free(phys_to_virt(page), huge_page_size, offset);
-        } else {
-            this->account(mmu::huge_page_size);
+        try {
+            mmupage page = _page_provider->alloc(huge_page_size, offset, ptep, _write);
+
+            if (!ptep.compare_exchange(pte, dirty(make_large_pte(page.paddr(), perm(page.cow()))))) {
+                _page_provider->free(page.vaddr(), huge_page_size, offset, ptep);
+            } else {
+                this->account(mmu::huge_page_size);
+            }
+        } catch(std::exception&) {
+            return false;
         }
         return true;
     }
+};
+
+template <account_opt Account = account_opt::no>
+class populate_small : public populate<Account> {
+public:
+    populate_small(page_allocator* pops, unsigned int perm, bool write = false, bool map_dirty = true) :
+        populate<Account>(pops, perm, write, map_dirty) { }
+    bool huge_page(hw_ptep ptep, uintptr_t offset) {
+        assert(0);
+        return false;
+    }
+    int nr_page_sizes(void) { return 1; }
 };
 
 struct tlb_gather {
@@ -510,15 +558,16 @@ struct tlb_gather {
         void* addr;
         size_t size;
         off_t offset; // FIXME: unneeded?
+        pt_element* ptep;
     };
     page_allocator* page_provider;
     size_t nr_pages = 0;
     tlb_page pages[max_pages];
-    void push(void* addr, size_t size, off_t offset) {
+    void push(void* addr, size_t size, off_t offset, hw_ptep ptep) {
         if (nr_pages == max_pages) {
             flush();
         }
-        pages[nr_pages++] = { addr, size, offset };
+        pages[nr_pages++] = { addr, size, offset, ptep.release() };
     }
     void flush() {
         if (!nr_pages) {
@@ -528,9 +577,9 @@ struct tlb_gather {
         for (auto i = 0u; i < nr_pages; ++i) {
             auto&& tp = pages[i];
             if (tp.size == page_size) {
-                page_provider->free(tp.addr, tp.offset);
+                page_provider->free(tp.addr, tp.offset, hw_ptep::force(tp.ptep));
             } else {
-                page_provider->free(tp.addr, tp.size, tp.offset);
+                page_provider->free(tp.addr, tp.size, tp.offset, hw_ptep::force(tp.ptep));
             }
         }
         nr_pages = 0;
@@ -553,13 +602,13 @@ public:
         // not-present may only mean mprotect(PROT_NONE).
         pt_element pte = ptep.read();
         ptep.write(make_empty_pte());
-        _tlb_gather.push(phys_to_virt(pte.addr(false)), page_size, offset);
+        _tlb_gather.push(phys_to_virt(pte.addr(false)), page_size, offset, ptep);
         this->account(mmu::page_size);
     }
     bool huge_page(hw_ptep ptep, uintptr_t offset) {
         pt_element pte = ptep.read();
         ptep.write(make_empty_pte());
-        _tlb_gather.push(phys_to_virt(pte.addr(true)), huge_page_size, offset);
+        _tlb_gather.push(phys_to_virt(pte.addr(true)), huge_page_size, offset, ptep);
         this->account(mmu::huge_page_size);
         return true;
     }
@@ -847,16 +896,16 @@ private:
         return addr;
     }
 public:
-    virtual void* alloc(uintptr_t offset) override {
+    virtual mmupage alloc(uintptr_t offset, hw_ptep ptep, bool write) override {
         return fill(memory::alloc_page(), offset, page_size);
     }
-    virtual void* alloc(size_t size, uintptr_t offset) override {
+    virtual mmupage alloc(size_t size, uintptr_t offset, hw_ptep ptep, bool write) override {
         return fill(memory::alloc_huge_page(size), offset, size);
     }
-    virtual void free(void *addr, uintptr_t offset) override {
+    virtual void free(void *addr, uintptr_t offset, hw_ptep ptep) override {
         return memory::free_page(addr);
     }
-    virtual void free(void *addr, size_t size, uintptr_t offset) override {
+    virtual void free(void *addr, size_t size, uintptr_t offset, hw_ptep ptep) override {
         return memory::free_huge_page(addr, size);
     }
     virtual void finalize() override {
@@ -903,27 +952,100 @@ public:
 class map_file_page_mmap : public page_allocator {
 private:
     file* _file;
+    off_t _foffset;
+    bool _shared;
 
 public:
-    map_file_page_mmap(file *file) : _file(file) {}
+    map_file_page_mmap(file *file, off_t off, bool shared) : _file(file), _foffset(off), _shared(shared) {}
     virtual ~map_file_page_mmap() {};
 
-    virtual void* alloc(uintptr_t offset) override {
-        return _file->get_page(offset, page_size);
+    virtual mmupage alloc(uintptr_t offset, hw_ptep ptep, bool write) override {
+        return alloc(page_size, offset, ptep, write);
     }
-    virtual void* alloc(size_t size, uintptr_t offset) override {
-        return _file->get_page(offset, size);
+    virtual mmupage alloc(size_t size, uintptr_t offset, hw_ptep ptep, bool write) override {
+        return _file->get_page(offset + _foffset, size, ptep, write, _shared);
     }
-    virtual void free(void *addr, uintptr_t offset) override {
-        _file->put_page(offset, page_size);
+    virtual void free(void *addr, uintptr_t offset, hw_ptep ptep) override {
+        free(addr, page_size, offset, ptep);
     }
-    virtual void free(void *addr, size_t size, uintptr_t offset) override {
-        _file->put_page(offset, size);
+    virtual void free(void *addr, size_t size, uintptr_t offset, hw_ptep ptep) override {
+        _file->put_page(addr, offset + _foffset, size, ptep);
     }
 
     void finalize() {
     }
 };
+
+// In the general case, we expect only one element in the list.
+static std::unordered_multimap<void *, hw_ptep> shared_fs_maps;
+// We need to reference count the buffer, but first we need to store the
+// buffer somewhere we can find
+static std::unordered_map<void *, unsigned int> shared_fs_buf_refcnt;
+// Can't use the vma_list_mutex, because if we do, we can have a deadlock where
+// we call into the filesystem to read data with the vma_list_mutex held - because
+// we do that for complex operate operations, and if the filesystem decides to evict
+// a page to read the selected buffer, we will need to access those data structures.
+static mutex shared_fs_mutex;
+
+static void fs_buf_get(void *buf_addr)
+{
+    auto b = shared_fs_buf_refcnt.find(buf_addr);
+    if (b == shared_fs_buf_refcnt.end()) {
+        shared_fs_buf_refcnt.emplace(buf_addr, 1);
+        return;
+    }
+    b->second++;
+}
+
+static bool fs_buf_put(void *buf_addr, unsigned dec = 1)
+{
+    auto b = shared_fs_buf_refcnt.find(buf_addr);
+    assert(b != shared_fs_buf_refcnt.end());
+    assert(b->second >= dec);
+    b->second -= dec;
+    if (b->second == 0) {
+        shared_fs_buf_refcnt.erase(buf_addr);
+        return true;
+    }
+    return false;
+}
+
+void add_mapping(void *buf_addr, void *page, hw_ptep ptep)
+{
+    WITH_LOCK(shared_fs_mutex) {
+        shared_fs_maps.emplace(page, ptep);
+        fs_buf_get(buf_addr);
+    }
+}
+
+bool remove_mapping(void *buf_addr, void *paddr, hw_ptep ptep)
+{
+    WITH_LOCK(shared_fs_mutex) {
+        auto buf = shared_fs_maps.equal_range(paddr);
+        for (auto it = buf.first; it != buf.second; it++) {
+            auto stored = (*it).second;
+            if (stored == ptep) {
+                shared_fs_maps.erase(it);
+                return fs_buf_put(buf_addr);
+            }
+        }
+    }
+    return false;
+}
+
+bool lookup_mapping(void *paddr, hw_ptep ptep)
+{
+    WITH_LOCK(shared_fs_mutex) {
+        auto buf = shared_fs_maps.equal_range(paddr);
+        for (auto it = buf.first; it != buf.second; it++) {
+            auto stored = (*it).second;
+            if (stored == ptep) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
@@ -933,11 +1055,11 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
             start = 0x200000000000ul;
         }
         start = find_hole(start, size);
-        v->set(start, start+size);
     } else {
         // we don't know if the given range is free, need to evacuate it first
         evacuate(start, start+size);
     }
+    v->set(start, start+size);
 
     vma_list.insert(*v);
 
@@ -969,6 +1091,47 @@ void vcleanup(void* addr, size_t size)
     }
 }
 
+template<account_opt Account = account_opt::no>
+ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
+{
+    page_allocator *map = vma->page_ops();
+    auto total = vma->has_flags(mmap_small) ?
+        vma->operate_range(populate_small<Account>(map, vma->perm(), write, vma->map_dirty()), v, size) :
+        vma->operate_range(populate<Account>(map, vma->perm(), write, vma->map_dirty()), v, size);
+    map->finalize();
+
+    return total;
+}
+
+void clear_pte(hw_ptep ptep)
+{
+    ptep.write(make_empty_pte());
+}
+
+void clear_pte(std::pair<void* const, hw_ptep>& pair)
+{
+    clear_pte(pair.second);
+}
+
+bool unmap_address(void *buf_addr, void *addr, size_t size)
+{
+    bool last;
+    unsigned refs = 0;
+    size = align_up(size, page_size);
+    assert(mutex_owned(&vma_list_mutex));
+    WITH_LOCK(shared_fs_mutex) {
+        for (uintptr_t a = reinterpret_cast<uintptr_t>(addr); size; a += page_size, size -= page_size) {
+            addr = reinterpret_cast<void*>(a);
+            auto buf = shared_fs_maps.equal_range(addr);
+            refs += clear_ptes(buf.first, buf.second);
+            shared_fs_maps.erase(addr);
+        }
+        last = refs ? fs_buf_put(buf_addr, refs) : false;
+    }
+    tlb_flush();
+    return last;
+}
+
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
 {
     bool search = !(flags & mmap_fixed);
@@ -978,19 +1141,19 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
     std::lock_guard<mutex> guard(vma_list_mutex);
     auto v = (void*) allocate(vma, start, size, search);
     if (flags & mmap_populate) {
-        vma->operate_range(populate<>(vma->page_ops(), perm, vma->map_dirty()), v, size);
+        populate_vma(vma, v, size);
     }
     return v;
 }
 
 std::unique_ptr<file_vma> default_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset)
 {
-    return std::unique_ptr<file_vma>(new file_vma(range, perm, file, offset, flags & mmu::mmap_shared, new map_file_page_read(file, offset)));
+    return std::unique_ptr<file_vma>(new file_vma(range, perm, flags, file, offset, new map_file_page_read(file, offset)));
 }
 
 std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset)
 {
-    return std::unique_ptr<file_vma>(new file_vma(range, perm, file, offset, flags & mmu::mmap_shared, new map_file_page_mmap(file)));
+    return std::unique_ptr<file_vma>(new file_vma(range, perm, flags, file, offset, new map_file_page_mmap(file, offset, flags & mmap_shared)));
 }
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
@@ -1000,18 +1163,13 @@ void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
     auto asize = align_up(size, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto *vma = f->mmap(addr_range(start, start + size), flags, perm, offset).release();
-    page_allocator *palloc = nullptr;
     void *v;
     WITH_LOCK(vma_list_mutex) {
         v = (void*) allocate(vma, start, asize, search);
         if (flags & mmap_populate) {
-            palloc = vma->page_ops();
-            vma->operate_range(populate<>(palloc, perm, vma->map_dirty()), v, asize);
+            populate_vma(vma, v, asize);
         }
     }
-    // call finalize outside of the lock so the file read will not happen under it
-    if (palloc)
-        palloc->finalize();
     return v;
 }
 
@@ -1193,16 +1351,14 @@ void vma::fault(uintptr_t addr, exception_frame *ef)
     auto hp_start = ::align_up(_range.start(), huge_page_size);
     auto hp_end = ::align_down(_range.end(), huge_page_size);
     size_t size;
-    if (hp_start <= addr && addr < hp_end) {
+    if (!has_flags(mmap_jvm_balloon|mmap_small) && (hp_start <= addr && addr < hp_end)) {
         addr = ::align_down(addr, huge_page_size);
         size = huge_page_size;
     } else {
         size = page_size;
     }
 
-    page_allocator *map = page_ops();
-    auto total = operate_range(populate<account_opt::yes>(map, _perm, map_dirty()), (void*)addr, size);
-    map->finalize();
+    auto total = populate_vma<account_opt::yes>(this, (void*)addr, size, ef->error_code & page_fault_write);
 
     if (_flags & mmap_jvm_heap) {
         memory::stats::on_jvm_heap_alloc(total);
@@ -1229,7 +1385,7 @@ void anon_vma::split(uintptr_t edge)
         return;
     }
     vma* n = new anon_vma(addr_range(edge, _range.end()), _perm, _flags);
-    _range = addr_range(_range.start(), edge);
+    set(_range.start(), edge);
     vma_list.insert(*n);
 }
 
@@ -1238,20 +1394,76 @@ error anon_vma::sync(uintptr_t start, uintptr_t end)
     return no_error();
 }
 
-jvm_balloon_vma::jvm_balloon_vma(uintptr_t start, uintptr_t end, balloon *b, unsigned perm, unsigned flags)
-    : vma(addr_range(start, end), perm_rw, 0, true), _balloon(b), _real_perm(perm), _real_flags(flags)
+// Balloon is backed by no pages, but in the case of partial copy, we may have
+// to back some of the pages. For that and for that only, we initialize a page
+// allocator. It is fine in this case to use the noinit allocator. Since this
+// area was supposed to be holding the balloon object before, so the JVM will
+// not count on it being initialized to any value.
+jvm_balloon_vma::jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start,
+                                 uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags)
+    : vma(addr_range(start, end), perm_rw, flags | mmap_jvm_balloon, true, page_allocator_noinitp),
+      _balloon(b), _jvm_addr(jvm_addr),
+      _real_perm(perm), _real_flags(flags & ~mmap_jvm_balloon), _real_size(end - start)
 {
+}
+
+// IMPORTANT: This code assumes that opportunistic copying never happens during
+// partial copying.  In general, this assumption is wrong. There is nothing
+// that prevents the JVM from doing both at the same time from the same object.
+// However, hotspot seems not to do it, which simplifies a lot our code.
+//
+// If that assumption fails to hold in some real life scenario (be it a hotspot
+// corner case or another JVM), the assertion eff == _effective_jvm_addr will
+// crash us and we will find it out.  If we need it, it is not impossible to
+// handle this case: all we have to do is create a list of effective addresses
+// and keep the partial counts independently.
+//
+// Explanation about partial copy:
+//
+// There are situations during which some Garbage Collectors will copy a large
+// object in parallel, using various threads, each being responsible for a part
+// of the object.
+//
+// If that happens, the simple balloon move algorithm will break. However,
+// because offset 'x' in the source will always be copied to offset 'x' in the
+// destination, we can still calculate the final destination object. This
+// address is the _effective_jvm_addr in the code bellow.
+//
+// The problem is that we cannot open the new balloon yet. Since the JVM
+// believes it is copying only a part of the object, the destination may (and
+// usually will) contain valid objects, that need to be themselves moved
+// somewhere else before we can install our object there.
+//
+// Also, we can't close the object fully when someone writes to it: because a
+// part of the object is now already freed, the JVM may and will go ahead and
+// copy another object to this location. To handle this case, we use the
+// variable _partial_copy, which keeps track of how much data has being copied
+// from this location to somewhere else. Because we know that the JVM has to
+// copy the whole object, when that counter reaches the amount of bytes we
+// expect in this vma, this means we can close this object (assuming no
+// opportunistic copy)
+//
+// It is also possible that the region will be written to during partial copy.
+// Although it is invalid to overwrite pieces of the object, it is perfectly
+// valid to write to locations that were already copied from. This is handled
+// in the fault handler itself, by mapping pages to the location that currently
+// holds the balloon vma. At some point, we will create an anonymous vma in its
+// place.
+bool jvm_balloon_vma::add_partial(size_t partial, unsigned char *eff)
+{
+    if (_effective_jvm_addr) {
+        assert(eff == _effective_jvm_addr);
+    } else {
+        _effective_jvm_addr= eff;
+    }
+
+    _partial_copy += partial;
+    return _partial_copy == real_size();
 }
 
 void jvm_balloon_vma::split(uintptr_t edge)
 {
-    auto end = _range.end();
-    if (edge <= _range.start() || edge >= end) {
-        return;
-    }
-    auto * n = new jvm_balloon_vma(edge, end, _balloon, _real_perm, _real_flags);
-    _range = addr_range(_range.start(), edge);
-    vma_list.insert(*n);
+    abort();
 }
 
 error jvm_balloon_vma::sync(uintptr_t start, uintptr_t end)
@@ -1261,78 +1473,128 @@ error jvm_balloon_vma::sync(uintptr_t start, uintptr_t end)
 
 void jvm_balloon_vma::fault(uintptr_t fault_addr, exception_frame *ef)
 {
-    std::lock_guard<mutex> guard(vma_list_mutex);
-    jvm_balloon_fault(_balloon, ef, this);
-    delete this;
-}
-
-void jvm_balloon_vma::detach_balloon()
-{
-    _balloon = nullptr;
-    // Could block the creation of the next vma. No need to evacuate, we have no pages
-    vma_list.erase(*this);
-    mmu::map_anon(addr(), size(), _real_flags, _real_perm);
+    if (jvm_balloon_fault(_balloon, ef, this)) {
+        return;
+    }
+    // Can only reach this case if we are doing partial copies
+    assert(_effective_jvm_addr);
+    // FIXME : This will always use a small page, due to the flag check we have
+    // in vma::fault. We can try to map the original worker with a huge page,
+    // and try to see if we succeed. Using a huge page is harder than it seems,
+    // because the JVM is not guaranteed to copy objects in huge page
+    // increments - and it usually won't.  If we go ahead and map a huge page
+    // subsequent copies *from* this location will not fault and we will lose
+    // track of the partial copy count.
+    vma::fault(fault_addr, ef);
 }
 
 jvm_balloon_vma::~jvm_balloon_vma()
 {
-    if (_balloon) {
-        // This is because the JVM may just decide to unmap a whole region if
-        // it believes the objects are no longer valid. It could be the case
-        // for a dangling mapping representing a balloon that was already moved
-        // out.
-        jvm_balloon_fault(_balloon, nullptr, this);
+    // it believes the objects are no longer valid. It could be the case
+    // for a dangling mapping representing a balloon that was already moved
+    // out.
+    vma_list.erase(*this);
+    assert(!(_real_flags & mmap_jvm_balloon));
+    mmu::map_anon(addr(), size(), _real_flags, _real_perm);
+
+    if (_effective_jvm_addr) {
+        // Can't just use size(), because although rare, the source and destination can
+        // have different alignments
+        auto end = ::align_down(_effective_jvm_addr + balloon_size, balloon_alignment);
+        auto s = end - ::align_up(_effective_jvm_addr, balloon_alignment);
+        mmu::map_jvm(_effective_jvm_addr, s, mmu::huge_page_size, _balloon);
     }
 }
 
-// This function marks an anonymous vma as holding the JVM Heap. The JVM may
-// create mappings for a variety of reasons, not all of them being the heap.
-// Since we're interested in knowing how many pages does the heap hold (to make
-// shrinking decisions) we need to mark those regions. The criteria that we'll
-// use for that is to, every time we create a jvm_balloon_vma, we mark the
-// previous anon vma that was in its place as holding the heap. That will work
-// most of the time and with most GC algos. If that is not sufficient, the
-// JVM will have to tell us about its regions itself.
-static vma *mark_jvm_heap(const void* addr)
+ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
 {
-    WITH_LOCK(vma_list_mutex) {
-        u64 a = reinterpret_cast<u64>(addr);
-        auto v = vma_list.find(addr_range(a, a+1), vma::addr_compare());
-        // It has to be somewhere!
-        assert(v != vma_list.end());
-        vma& vma = *v;
-
-        if (!vma.has_flags(mmap_jvm_heap)) {
-            auto mem = vma.operate_range(count_maps());
-            memory::stats::on_jvm_heap_alloc(mem);
-        }
-
-        vma.update_flags(mmap_jvm_heap);
-
-        return &vma;
-    }
-}
-
-ulong map_jvm(const void* addr, size_t size, balloon *b)
-{
+    auto addr = ::align_up(jvm_addr, align);
     auto start = reinterpret_cast<uintptr_t>(addr);
 
-    vma *v = mark_jvm_heap(addr);
-
-    auto* vma = new mmu::jvm_balloon_vma(start, start + size, b, v->perm(), v->flags());
+    vma* v;
     WITH_LOCK(vma_list_mutex) {
-        auto ret = evacuate(start, start + size);
+        u64 a = reinterpret_cast<u64>(addr);
+        v = &*vma_list.find(addr_range(a, a+1), vma::addr_compare());
+        // It has to be somewhere!
+        assert(v != &*vma_list.end());
+        assert(v->has_flags(mmap_jvm_heap) | v->has_flags(mmap_jvm_balloon));
+        if (v->has_flags(mmap_jvm_balloon) && (v->addr() == addr)) {
+            jvm_balloon_vma *j = static_cast<jvm_balloon_vma *>(&*v);
+            if (&*j->_balloon != &*b) {
+                j->_balloon = b;
+            }
+            return 0;
+        }
+    }
+
+    auto* vma = new mmu::jvm_balloon_vma(jvm_addr, start, start + size, b, v->perm(), v->flags());
+
+    WITH_LOCK(vma_list_mutex) {
+        // This means that the mapping that we had before was a balloon mapping
+        // that was laying around and wasn't updated to an anon mapping. If we
+        // allow it to split it would significantly complicate our code, since
+        // now the finishing code would have to deal with the case where the
+        // bounds found in the vma are not the real bounds. We delete it right
+        // away and avoid it altogether.
+        addr_range r(start, start + size);
+        auto range = vma_list.equal_range(r, vma::addr_compare());
+
+        for (auto i = range.first; i != range.second; ++i) {
+            if (i->has_flags(mmap_jvm_balloon)) {
+                jvm_balloon_vma *jvma = static_cast<jvm_balloon_vma *>(&*i);
+                // If there is an effective address this means this is a
+                // partial copy. We cannot close it here because the copy is
+                // still ongoing. We can, though, assume that if we are
+                // installing a new vma over a part of this region, that
+                // particular part was already copied to in the original
+                // balloon.
+                //
+                // FIXME: This is solvable by reducing the size of the vma and
+                // keeping track of the original size. Still, we can't really
+                // call the split code directly because that will delete the
+                // vma and cause its termination
+                if (jvma->effective_jvm_addr() != nullptr) {
+                    auto end = start + size;
+                    // Should have exited before the creation of the vma,
+                    // just updating the balloon pointer.
+                    assert(jvma->start() != start);
+                    // Since we will change its position in the tree, for the sake of future
+                    // lookups we need to reinsert it.
+                    vma_list.erase(*jvma);
+                    if (jvma->start() < start) {
+                        assert(jvma->partial() >= (jvma->end() - start));
+                        jvma->set(jvma->start(), start);
+                    } else {
+                        assert(jvma->partial() >= (end - jvma->start()));
+                        jvma->set(end, jvma->end());
+                    }
+                    vma_list.insert(*jvma);
+                } else {
+                    // Note how v and jvma are different. This is because this one,
+                    // we will delete.
+                    auto& v = *i--;
+                    vma_list.erase(v);
+                    // Finish the move. In practice, it will temporarily remap an
+                    // anon mapping here, but this should be rare. Let's not
+                    // complicate the code to optimize it. There are no
+                    // guarantees that we are talking about the same balloon If
+                    // this is the old balloon
+                    delete &v;
+                }
+            }
+        }
+
+        evacuate(start, start + size);
         vma_list.insert(*vma);
-        return ret;
+        return vma->size();
     }
     return 0;
 }
 
-file_vma::file_vma(addr_range range, unsigned perm, fileref file, f_offset offset, bool shared, page_allocator* page_ops)
-    : vma(range, perm, 0, !shared, page_ops)
+file_vma::file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator* page_ops)
+    : vma(range, perm, flags | mmap_small, !(flags & mmap_shared), page_ops)
     , _file(file)
     , _offset(offset)
-    , _shared(shared)
 {
     int err = validate_perm(perm);
 
@@ -1353,7 +1615,7 @@ void file_vma::split(uintptr_t edge)
     }
     auto off = offset(edge);
     vma *n = _file->mmap(addr_range(edge, _range.end()), _flags, _perm, off).release();
-    _range = addr_range(_range.start(), edge);
+    set(_range.start(), edge);
     vma_list.insert(*n);
 }
 
@@ -1390,7 +1652,7 @@ private:
 
 error file_vma::sync(uintptr_t start, uintptr_t end)
 {
-    if (!_shared)
+    if (!has_flags(mmap_shared))
         return make_error(ENOMEM);
     start = std::max(start, _range.start());
     end = std::min(end, _range.end());
@@ -1411,7 +1673,7 @@ int file_vma::validate_perm(unsigned perm)
         return EACCES;
     }
     if (perm & perm_write) {
-        if (_shared && !(_file->f_flags & FWRITE)) {
+        if (has_flags(mmap_shared) && !(_file->f_flags & FWRITE)) {
             return EACCES;
         }
     }
@@ -1433,7 +1695,7 @@ std::unique_ptr<file_vma> shm_file::mmap(addr_range range, unsigned flags, unsig
     return map_file_mmap(this, range, flags, perm, offset);
 }
 
-void* shm_file::get_page(uintptr_t offset, size_t size)
+mmupage shm_file::get_page(uintptr_t offset, size_t size, hw_ptep ptep, bool write, bool shared)
 {
     uintptr_t hp_off = ::align_down(offset, huge_page_size);
     void *addr;
@@ -1451,7 +1713,7 @@ void* shm_file::get_page(uintptr_t offset, size_t size)
     return static_cast<char*>(addr) + offset - hp_off;
 }
 
-void shm_file::put_page(uintptr_t offset, size_t size) {}
+void shm_file::put_page(void *addr, uintptr_t offset, size_t size, hw_ptep ptep) {}
 
 shm_file::shm_file(size_t size, int flags) : special_file(flags, DTYPE_UNSPEC), _size(size) {}
 

@@ -16,57 +16,26 @@
 #include <osv/error.h>
 #include <osv/addr_range.hh>
 #include <unordered_map>
+#include <memory>
+#include <osv/mmu-defs.hh>
+
+#ifndef AARCH64_PORT_STUB
+#include "arch-mmu.hh"
+#endif /* !AARCH64_PORT_STUB */
 
 struct exception_frame;
 class balloon;
+typedef std::shared_ptr<balloon> balloon_ptr;
+
 /**
  * MMU namespace
  */
 namespace mmu {
 
-constexpr uintptr_t page_size = 4096;
-constexpr int page_size_shift = 12; // log2(page_size)
-
-constexpr int pte_per_page = 512;
-constexpr int pte_per_page_shift = 9; // log2(pte_per_page)
-
-constexpr uintptr_t huge_page_size = mmu::page_size*pte_per_page; // 2 MB
-
-typedef uint64_t f_offset;
-
-static char* const phys_mem = reinterpret_cast<char*>(0xffffc00000000000);
-// area for debug allocations:
-static char* const debug_base = reinterpret_cast<char*>(0xffffe00000000000);
-
 constexpr inline unsigned pt_index(void *virt, unsigned level)
 {
     return (reinterpret_cast<ulong>(virt) >> (page_size_shift + level * pte_per_page_shift)) & (pte_per_page - 1);
 }
-
-enum {
-    perm_read = 1,
-    perm_write = 2,
-    perm_exec = 4,
-    perm_rx = perm_read | perm_exec,
-    perm_rw = perm_read | perm_write,
-    perm_rwx = perm_read | perm_write | perm_exec,
-};
-
-enum {
-    page_fault_prot  = 1ul << 0,
-    page_fault_write = 1ul << 1,
-    page_fault_user  = 1ul << 2,
-    page_fault_rsvd  = 1ul << 3,
-    page_fault_insn  = 1ul << 4,
-};
-
-enum {
-    mmap_fixed       = 1ul << 0,
-    mmap_populate    = 1ul << 1,
-    mmap_shared      = 1ul << 2,
-    mmap_uninitialized = 1ul << 3,
-    mmap_jvm_heap    = 1ul << 4,
-};
 
 struct page_allocator;
 
@@ -124,7 +93,7 @@ public:
 
 class file_vma : public vma {
 public:
-    file_vma(addr_range range, unsigned perm, fileref file, f_offset offset, bool shared, page_allocator *page_ops);
+    file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops);
     ~file_vma();
     virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
@@ -133,21 +102,38 @@ private:
     f_offset offset(uintptr_t addr);
     fileref _file;
     f_offset _offset;
-    bool _shared;
 };
+
+ulong map_jvm(unsigned char* addr, size_t size, size_t align, balloon_ptr b);
 
 class jvm_balloon_vma : public vma {
 public:
-    jvm_balloon_vma(uintptr_t start, uintptr_t end, balloon *b, unsigned perm, unsigned flags);
+    jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start, uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags);
     virtual ~jvm_balloon_vma();
     virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
     void detach_balloon();
+    unsigned char *jvm_addr() { return _jvm_addr; }
+    unsigned char *effective_jvm_addr() { return _effective_jvm_addr; }
+    bool add_partial(size_t partial, unsigned char *eff);
+    size_t partial() { return _partial_copy; }
+    // Iff we have a partial, the size may be temporarily changed. We keep it in a different
+    // variable so don't risk breaking any mmu core code that relies on the derived size()
+    // being the same.
+    uintptr_t real_size() const { return _real_size; }
+    friend ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b);
+protected:
+    balloon_ptr _balloon;
+    unsigned char *_jvm_addr;
 private:
-    balloon *_balloon;
+    unsigned char *_effective_jvm_addr = nullptr;
+    uintptr_t _partial_addr = 0;
+    anon_vma *_partial_vma = nullptr;
+    size_t _partial_copy = 0;
     unsigned _real_perm;
     unsigned _real_flags;
+    uintptr_t _real_size;
 };
 
 class shm_file final : public special_file {
@@ -158,8 +144,11 @@ public:
     virtual int stat(struct stat* buf) override;
     virtual int close() override;
     virtual std::unique_ptr<file_vma> mmap(addr_range range, unsigned flags, unsigned perm, off_t offset) override;
-    virtual void* get_page(uintptr_t offset, size_t size) override;
-    virtual void put_page(uintptr_t offset, size_t size) override;
+
+#ifndef AARCH64_PORT_STUB
+    virtual mmupage get_page(uintptr_t offset, size_t size, hw_ptep ptep, bool write, bool shared) override;
+    virtual void put_page(void *addr, uintptr_t offset, size_t size, hw_ptep ptep) override;
+#endif /* !AARCH64_PORT_STUB */
 };
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
@@ -175,8 +164,18 @@ bool is_linear_mapped(const void *addr, size_t size);
 bool ismapped(const void *addr, size_t size);
 bool isreadable(void *addr, size_t size);
 std::unique_ptr<file_vma> default_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset);
+std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset);
 
-typedef uint64_t phys;
+#ifndef AARCH64_PORT_STUB
+bool unmap_address(void* buf, void *addr, size_t size);
+void add_mapping(void *buf_addr, void* addr, hw_ptep ptep);
+bool remove_mapping(void *buf_addr, void *paddr, hw_ptep ptep);
+bool lookup_mapping(void *paddr, hw_ptep ptep);
+void tlb_flush();
+void clear_pte(hw_ptep ptep);
+void clear_pte(std::pair<void* const, hw_ptep>& pair);
+#endif /* !AARCH64_PORT_STUB */
+
 phys virt_to_phys(void *virt);
 void* phys_to_virt(phys pa);
 
@@ -211,6 +210,17 @@ void vcleanup(void* addr, size_t size);
 void vm_fault(uintptr_t addr, exception_frame* ef);
 
 std::string procfs_maps();
+
+template<typename I>
+unsigned clear_ptes(I start,  I end)
+{
+    unsigned i = 0;
+    for (auto it = start; it != end; it++) {
+        clear_pte(*it);
+        i++;
+    }
+    return i;
+}
 
 }
 

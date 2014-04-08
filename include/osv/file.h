@@ -50,6 +50,10 @@
 #include <osv/rcu.hh>
 #include <osv/error.h>
 
+#ifndef AARCH64_PORT_STUB
+#include "arch-mmu.hh"
+#endif /* !AARCH64_PORT_STUB */
+
 #endif
 
 __BEGIN_DECLS
@@ -96,8 +100,10 @@ struct file {
 	virtual std::unique_ptr<mmu::file_vma> mmap(addr_range range, unsigned flags, unsigned perm, off_t offset) {
 	    throw make_error(ENODEV);
 	}
-	virtual void* get_page(uintptr_t offset, size_t size) { throw make_error(ENOSYS);}
-	virtual void put_page(uintptr_t offset, size_t size) { throw make_error(ENOSYS);}
+#ifndef AARCH64_PORT_STUB
+	virtual mmu::mmupage get_page(uintptr_t offset, size_t size, mmu::hw_ptep ptep, bool write, bool shared) { throw make_error(ENOSYS); }
+	virtual void put_page(void *addr, uintptr_t offset, size_t size, mmu::hw_ptep ptep) { throw make_error(ENOSYS); }
+#endif /* !AARCH64_PORT_STUB */
 
 	int		f_flags;	/* open flags */
 	int		f_count;	/* reference count, see below */

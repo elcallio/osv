@@ -34,7 +34,7 @@ def pt_index(addr, level):
     return (addr >> (12 + 9 * level)) & 511
 
 def phys_cast(addr, type):
-    return gdb.Value(addr + phys_mem).cast(type.pointer())
+    return gdb.parse_and_eval('0x%x' % (addr + phys_mem)).cast(type.pointer())
 
 def values(_dict):
     if hasattr(_dict, 'viewvalues'):
@@ -226,6 +226,20 @@ class osv_memory(gdb.Command):
         print ("Free Memory:  %d Bytes (%.2f%%)" % 
                (freemem, (freemem*100.0/memsize)))
 
+class osv_waiters(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'osv waiters',
+                             gdb.COMMAND_USER, gdb.COMPLETE_NONE)
+    def invoke(self, arg, from_tty):
+        reclaimer = gdb.lookup_global_symbol("memory::reclaimer_thread")
+        waiters = reclaimer.value()["_oom_blocked"]["_waiters"]
+        waiters_list = intrusive_list(waiters)
+        gdb.write('waiters:\n')
+        for w in waiters_list:
+            t = w["owner"].dereference().cast(thread_type)["_id"]
+            print(t)
+            gdb.write("Thread %d waits for %d Bytes\n" % (t, int(w["bytes"])))
+
 #
 # Returns a u64 value from a stats given a field name.
 #
@@ -394,7 +408,7 @@ def permstr(perm):
     return bits2str(perm, ['r', 'w', 'x'])
 
 def flagstr(flags):
-    return bits2str(flags, ['f', 'p', 's', 'u', 'j'])
+    return bits2str(flags, ['f', 'p', 's', 'u', 'j', 'm', 'b'])
 
 class osv_mmap(gdb.Command):
     def __init__(self):
@@ -560,7 +574,8 @@ class vmstate(object):
         self.cpu_list = cpu_list
 
     def load_thread_list(self):
-        self.thread_list = sorted(unordered_map(gdb.lookup_global_symbol('sched::thread_map').value()), key=lambda x: int(x["_id"]))
+        threads = map(gdb.Value.dereference, unordered_map(gdb.lookup_global_symbol('sched::thread_map').value()))
+        self.thread_list = sorted(threads, key=lambda x: int(x["_id"]))
 
     def cpu_from_thread(self, thread):
         stack = thread['_attr']['_stack']
@@ -684,6 +699,7 @@ class osv_info_threads(gdb.Command):
         gdb.Command.__init__(self, 'osv info threads',
                              gdb.COMMAND_USER, gdb.COMPLETE_NONE)
     def invoke(self, arg, for_tty):
+        thread_nr = 0
         exit_thread_context()
         state = vmstate()
         for t in state.thread_list:
@@ -729,6 +745,8 @@ class osv_info_threads(gdb.Command):
                     gdb.write("\tjoining on %s\n" % fr.frame.read_var("this"))
 
                 show_thread_timers(t)
+                thread_nr += 1
+        gdb.write('Number of threads: %d\n' % thread_nr)
 
 class osv_info_callouts(gdb.Command):
     def __init__(self):
@@ -774,10 +792,10 @@ class osv_thread(gdb.Command):
         state = vmstate()
         thread = None
         for t in state.thread_list:
-            if t.address.cast(ulong_type) == int(arg, 0):
+            if ulong(t.address) == int(arg, 0):
                 thread = t
             with thread_context(t, state):
-                if t['_id'] == int(arg, 0):
+                if to_int(t['_id']) == int(arg, 0):
                     thread = t
         if not thread:
             print('Not found')
@@ -1090,7 +1108,7 @@ def drivers():
 def show_virtio_driver(v):
     gdb.write('%s at %s\n' % (v.dereference().dynamic_type, v))
     vb = v.cast(virtio_driver_type.pointer())
-    for qidx in range(0, vb['_num_queues']):
+    for qidx in range(0, to_int(vb['_num_queues'])):
         q = vb['_queues'][qidx]
         gdb.write('  queue %d at %s\n' % (qidx, q))
         avail_guest_idx = q['_avail']['_idx']['_M_i']
@@ -1226,6 +1244,7 @@ class osv_info_virtio(gdb.Command):
 osv()
 osv_heap()
 osv_memory()
+osv_waiters()
 osv_mmap()
 osv_zfs()
 osv_syms()

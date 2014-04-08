@@ -632,6 +632,70 @@ out:
 	return (error);
 }
 
+
+static int zfs_truncate(struct vnode *vp, off_t new_size);
+
+static int
+zfs_arc(vnode_t *vp, struct file* fp, uio_t *uio, unsigned action)
+{
+	znode_t		*zp = VTOZ(vp);
+	zfsvfs_t	*zfsvfs = zp->z_zfsvfs;
+	objset_t	*os;
+	ssize_t		nbytes = uio->uio_resid;
+	int			error = EIO;
+	rl_t		*rl;
+
+	ZFS_ENTER(zfsvfs);
+	ZFS_VERIFY_ZP(zp);
+	os = zfsvfs->z_os;
+
+	if (zp->z_pflags & ZFS_AV_QUARANTINED) {
+		ZFS_EXIT(zfsvfs);
+		return (EACCES);
+	}
+
+	/*
+	 * Fasttrack empty reads
+	 */
+	if (uio->uio_resid == 0) {
+		ZFS_EXIT(zfsvfs);
+		return (0);
+	}
+
+	if ((uio->uio_loffset + uio->uio_resid) > zp->z_size) {
+		nbytes -= (uio->uio_loffset + uio->uio_resid) - zp->z_size;
+	}
+
+	/*
+	 * Validate file offset
+	 */
+	if (uio->uio_loffset < (offset_t)0) {
+		ZFS_EXIT(zfsvfs);
+		return (EINVAL);
+	}
+
+	/*
+	 * Lock the range against changes.
+	 */
+	rl = zfs_range_lock(zp, uio->uio_loffset, uio->uio_resid, RL_READER);
+
+	nbytes = MIN(nbytes, zfs_read_chunk_size -
+		P2PHASE(uio->uio_loffset, zfs_read_chunk_size));
+
+	error = dmu_map_uio(os, zp->z_id, uio, nbytes, action);
+	if (error) {
+		/* convert checksum errors into IO errors */
+		if (error == ECKSUM)
+			error = EIO;
+	}
+
+	zfs_range_unlock(rl);
+
+	ZFS_ACCESSTIME_STAMP(zfsvfs, zp);
+	ZFS_EXIT(zfsvfs);
+	return (error);
+}
+
 /*
  * Write the bytes to a file.
  *
@@ -4884,4 +4948,5 @@ struct vnops zfs_vnops = {
 	zfs_inactive,			/* inactive */
 	zfs_truncate,			/* truncate */
 	zfs_link,			/* link */
+	zfs_arc,            /* arc */
 };
