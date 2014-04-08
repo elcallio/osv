@@ -858,31 +858,31 @@ def all_traces():
     gdb.lookup_global_symbol('gdb_trace_function_entry')
 
     inf = gdb.selected_inferior()
-    max_trace = ulong(gdb.parse_and_eval('max_trace'))
     trace_page_size = ulong(gdb.parse_and_eval('trace_page_size'))
     tp_ptr = gdb.lookup_type('tracepoint_base').pointer()
     backtrace_len = ulong(gdb.parse_and_eval('tracepoint_base::backtrace_len'))
     tracepoints = {}
     
-    trace_buffers_in_use = gdb.lookup_global_symbol('trace_buffers_in_use').value()
-
-    while trace_buffers_in_use:
-        trace_log = trace_buffers_in_use['base']
-        last = ulong(trace_buffers_in_use['last'])        
-        
-        trace_buffers_in_use = trace_buffers_in_use['next']        
-        
-        if not trace_log:
+    state = vmstate();
+    
+    trace_buffer_offset = ulong(gdb.parse_and_eval('&trace_buffer._var'))
+    
+    for cpu in values(state.cpu_list):
+        precpu_base = ulong(cpu.obj['percpu_base'])        
+        trace_buffer = gdb.parse_and_eval('(trace_buf *)0x%x' % (precpu_base + trace_buffer_offset)) 
+        trace_log_base = trace_buffer['_base']        
+        last = ulong(trace_buffer['_last'])        
+        max_trace = ulong(trace_buffer['_size'])
+                
+        if not trace_log_base:
             continue
         
-        trace_log = inf.read_memory(trace_log, max_trace)        
+        trace_log = inf.read_memory(trace_log_base, max_trace)        
         
         last %= max_trace
         pivot = align_up(last, trace_page_size)
         trace_log = concat(trace_log[pivot:], trace_log[:pivot])
         last += max_trace - pivot
-
-        continue
     
         i = 0
         while i < last:
@@ -891,6 +891,10 @@ def all_traces():
                 i = align_up(i + 8, trace_page_size)
                 continue
                 
+            # end marker. record being written                            
+            if tp_key == -1:
+                break 
+            
             i += 8
     
             thread, thread_name, time, cpu, flags = struct.unpack('Q16sQII', trace_log[i:i+40])

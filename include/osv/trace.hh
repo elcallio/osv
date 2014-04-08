@@ -326,7 +326,6 @@ public:
             return;
         }
         auto tr = allocate_trace_record(size());
-        tr->tp = this;
         tr->thread = sched::thread::current();
         tr->thread_name = tr->thread->name_raw();
         tr->time = 0;
@@ -339,6 +338,7 @@ public:
         tr->backtrace = false;
         log_backtrace(tr, buffer);
         serialize(buffer, as);
+        tr->tp = this; // do this last to indicate the record is complete
     }
     void serialize(void* buffer, std::tuple<s_args...> as) {
         serializer<0, sizeof...(s_args), s_args...>::write(buffer, 0, as);

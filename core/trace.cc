@@ -46,25 +46,22 @@ struct tracepoint_patch_sites_type {
 tracepoint_patch_sites_type tracepoint_patch_sites;
 
 constexpr size_t trace_page_size = 4096;  // need not match arch page size
-constexpr unsigned max_trace = trace_page_size * 1024;
 
 // Having a struct is more complex than it need be for just per-vcpu buffers,
 // _but_ it is in line with later on having rotating buffers, thus wwhy not do it already
 struct trace_buf {
-    // for gdb script, to easily go through
-    const trace_buf * next;
-    char * base __attribute__((may_alias));
-    size_t last;
+    char * _base __attribute__((may_alias));
+    size_t _last;
+    size_t _size;
 
     trace_buf() :
-            next(nullptr), base(nullptr), last(0) {
+            _base(nullptr), _last(0), _size(0) {
     }
-    trace_buf(const trace_buf * nb) :
-            next(nb), base(
-                    static_cast<char*>(aligned_alloc(sizeof(long), max_trace))), last(
-                    0)
-    {
-        bzero(base, max_trace);;
+    trace_buf(size_t size) :
+            _base(static_cast<char*>(aligned_alloc(sizeof(long), size))), _last(
+                    0), _size(size) {
+        bzero(_base, _size);
+        ;
     }
     trace_buf(const trace_buf&) = delete;
     trace_buf(trace_buf && buf) {
@@ -75,13 +72,13 @@ struct trace_buf {
         // makes it easier to keep the gdb trace extraction working.
         // When traces are managed through wire API instead, this should be
         // replaced.
-        delete base;
+        delete _base;
     }
     trace_buf & operator=(const trace_buf&) = delete;
     trace_buf & operator=(trace_buf && buf) {
-        std::swap(this->base, buf.base);
-        std::swap(this->last, buf.last);
-        std::swap(this->next, buf.next);
+        std::swap(this->_base, buf._base);
+        std::swap(this->_last, buf._last);
+        std::swap(this->_size, buf._size);
         return *this;
     }
 
@@ -90,24 +87,26 @@ struct trace_buf {
     trace_record * allocate_trace_record(size_t size) {
         size += sizeof(trace_record);
         size = align_up(size, sizeof(long));
-        size_t p = last;
+        size_t p = _last;
         size_t pn = p + size;
         if (align_down(p, trace_page_size) != align_down(pn, trace_page_size)) {
             // crossed page boundary
             pn = align_up(p, trace_page_size) + size;
         }
-        char * const pp = &base[p % max_trace];
+        auto * tr0 = reinterpret_cast<trace_record*>(&_base[p % _size]);
+        auto * tr1 = reinterpret_cast<trace_record*>(&_base[(pn - size) % _size]);
         // clear the first word, do indicate an padding at the end of the page
-        reinterpret_cast<trace_record*>(pp)->tp = nullptr;
-        last = pn;
-        return reinterpret_cast<trace_record*>(&base[(pn - size) % max_trace]);
+        tr0->tp = nullptr;
+        // Put an "end-marker" on the record being written to signify this is yet incomplete.
+        // Reader is only this vcpu or attached debugger (+TSO archs only so far) -> no fence needed.
+        tr1->tp = reinterpret_cast<tracepoint_base *>(-1);
+        _last = pn;
+        return tr1;
 
     }
 };
 
 PERCPU(trace_buf, trace_buffer);
-// for gdb. just walk through the single link list. not pretty, but easy.
-trace_buf * trace_buffers_in_use = nullptr;
 bool trace_enabled;
 
 typeof(tracepoint_base::tp_list) tracepoint_base::tp_list __attribute__((init_priority((int)init_prio::tracepoint_base)));
@@ -124,10 +123,10 @@ void enable_tracepoint(std::string wildcard)
     static bool buffers_initialized;
 
     if (!buffers_initialized) {
+        const size_t size = trace_page_size * std::max(size_t(256), sched::cpus.size());
         for (auto c : sched::cpus) {
             auto * tbp = trace_buffer.for_cpu(c);
-            *tbp = trace_buf(trace_buffers_in_use);
-            trace_buffers_in_use = tbp;
+            *tbp = trace_buf(size);
         }
         buffers_initialized = true;
     }
