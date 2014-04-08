@@ -105,7 +105,6 @@ CFLAGS += -I $(src)/libc/internal -I  $(src)/libc/arch/$(arch) \
 	-Wno-missing-braces -Wno-parentheses -Wno-unused-but-set-variable
 
 
-$(info $(CFLAGS))
 ASFLAGS = -g $(autodepend) -DASSEMBLY
 
 fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
