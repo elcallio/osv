@@ -60,6 +60,8 @@ struct trace_buf {
     trace_buf(size_t size) :
             _base(static_cast<char*>(aligned_alloc(sizeof(long), size))), _last(
                     0), _size(size) {
+        assert((size & (size - 1)) == 0 && "size must be power of two");
+        // Q: should the above be a throw?
         bzero(_base, _size);
         ;
     }
@@ -82,8 +84,6 @@ struct trace_buf {
         return *this;
     }
 
-    // keeping more or less the exact same logging buffer logic as before
-    // to avoid messing with the extraction
     trace_record * allocate_trace_record(size_t size) {
         size += sizeof(trace_record);
         size = align_up(size, sizeof(long));
@@ -93,16 +93,23 @@ struct trace_buf {
             // crossed page boundary
             pn = align_up(p, trace_page_size) + size;
         }
-        auto * tr0 = reinterpret_cast<trace_record*>(&_base[p % _size]);
-        auto * tr1 = reinterpret_cast<trace_record*>(&_base[(pn - size) % _size]);
+        auto * tr0 = reinterpret_cast<trace_record*>(&_base[index(p)]);
+        auto * tr1 = reinterpret_cast<trace_record*>(&_base[index(pn - size)]);
         // clear the first word, do indicate an padding at the end of the page
         tr0->tp = nullptr;
         // Put an "end-marker" on the record being written to signify this is yet incomplete.
         // Reader is only this vcpu or attached debugger (+TSO archs only so far) -> no fence needed.
         tr1->tp = reinterpret_cast<tracepoint_base *>(-1);
-        _last = pn;
+        // Scale down the _last marker already. Since we cannot know that _size is a multiple of
+        // MAX_SIZE_T we could (after quite a while) overflow to zero while in the middle of the buf,
+        // loosing part of the trace/corrupting things.
+        _last = index(pn);
         return tr1;
 
+    }
+private:
+    inline size_t index(size_t s) const {
+        return s & (_size - 1);
     }
 };
 
@@ -123,7 +130,11 @@ void enable_tracepoint(std::string wildcard)
     static bool buffers_initialized;
 
     if (!buffers_initialized) {
-        const size_t size = trace_page_size * std::max(size_t(256), sched::cpus.size());
+        // Ensure we're using power of two sizes, so round up num cpus to ^2
+        const size_t ncpu = 1 << size_t(std::log2(sched::cpus.size()));
+        // TODO: examine these defaults. I'm guessing less than 256*mt sized buffers
+        // will be subpar, so even if it bloats us on >4 vcpu lets do this for now.
+        const size_t size = trace_page_size * std::max(size_t(256), 1024 / ncpu);
         for (auto c : sched::cpus) {
             auto * tbp = trace_buffer.for_cpu(c);
             *tbp = trace_buf(size);
