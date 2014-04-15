@@ -340,6 +340,7 @@ public:
         tr->backtrace = false;
         log_backtrace(tr, buffer);
         serialize(buffer, as);
+        barrier();
         tr->tp = this; // do this last to indicate the record is complete
     }
     void serialize(void* buffer, std::tuple<s_args...> as) {

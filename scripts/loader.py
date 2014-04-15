@@ -8,6 +8,7 @@ import json
 import math
 import itertools
 import operator
+import heapq
 from glob import glob
 from collections import defaultdict
 
@@ -883,17 +884,18 @@ def all_traces():
     
     state = vmstate();
     
-    trace_buffer_offset = ulong(gdb.parse_and_eval('&trace_buffer._var'))
-    
-    for cpu in values(state.cpu_list):
+    trace_buffer_offset = ulong(gdb.parse_and_eval('&percpu_trace_buffer._var'))
+
+    def one_cpu_trace(cpu):
         precpu_base = ulong(cpu.obj['percpu_base'])        
         trace_buffer = gdb.parse_and_eval('(trace_buf *)0x%x' % (precpu_base + trace_buffer_offset)) 
-        trace_log_base = trace_buffer['_base']        
+        trace_log_base_ptr = trace_buffer['_base']        
+        trace_log_base  = unique_ptr_get(trace_log_base_ptr)
         last = ulong(trace_buffer['_last'])        
         max_trace = ulong(trace_buffer['_size'])
-                
+                        
         if not trace_log_base:
-            continue
+            raise StopIteration
         
         trace_log = inf.read_memory(trace_log_base, max_trace)        
         
@@ -936,7 +938,10 @@ def all_traces():
             i += size
             i = align_up(i, 8)
             yield Trace(tp, thread, thread_name, time, cpu, data, backtrace=backtrace)
-
+             
+    iters = map(lambda cpu: one_cpu_trace(cpu), values(state.cpu_list))                
+    return heapq.merge(*iters)
+    
 def save_traces_to_file(filename):
     trace.write_to_file(filename, list(all_traces()))
 
