@@ -301,7 +301,7 @@ public:
     void operator()(r_args... as) {
 #ifdef __x86_64__
         asm goto("1: .byte 0x0f, 0x1f, 0x44, 0x00, 0x00 \n\t"  // 5-byte nop
-                 ".pushsection .tracepoint_patch_sites, \"a\", @progbits \n\t"
+                 ".pushsection .tracepoint_patch_sites, \"aw\", @progbits \n\t"
                  ".quad %c[id] \n\t"
                  ".quad %c[type] \n\t"
                  ".quad 1b \n\t"
@@ -328,7 +328,6 @@ public:
             return;
         }
         auto tr = allocate_trace_record(size());
-        tr->tp = this;
         tr->thread = sched::thread::current();
         tr->thread_name = tr->thread->name_raw();
         tr->time = 0;
@@ -341,9 +340,11 @@ public:
         tr->backtrace = false;
         log_backtrace(tr, buffer);
         serialize(buffer, as);
+        barrier();
+        tr->tp = this; // do this last to indicate the record is complete
     }
     void serialize(void* buffer, std::tuple<s_args...> as) {
-        return serializer<0, sizeof...(s_args), s_args...>::write(buffer, 0, as);
+        serializer<0, sizeof...(s_args), s_args...>::write(buffer, 0, as);
     }
     size_t size() {
         return base_size() + serializer<0, sizeof...(s_args), s_args...>::size(0);

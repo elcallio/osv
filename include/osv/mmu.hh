@@ -18,10 +18,9 @@
 #include <unordered_map>
 #include <memory>
 #include <osv/mmu-defs.hh>
+#include <osv/align.hh>
 
-#ifndef AARCH64_PORT_STUB
 #include "arch-mmu.hh"
-#endif /* !AARCH64_PORT_STUB */
 
 struct exception_frame;
 class balloon;
@@ -145,10 +144,8 @@ public:
     virtual int close() override;
     virtual std::unique_ptr<file_vma> mmap(addr_range range, unsigned flags, unsigned perm, off_t offset) override;
 
-#ifndef AARCH64_PORT_STUB
     virtual mmupage get_page(uintptr_t offset, size_t size, hw_ptep ptep, bool write, bool shared) override;
     virtual void put_page(void *addr, uintptr_t offset, size_t size, hw_ptep ptep) override;
-#endif /* !AARCH64_PORT_STUB */
 };
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
@@ -166,7 +163,6 @@ bool isreadable(void *addr, size_t size);
 std::unique_ptr<file_vma> default_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset);
 std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned flags, unsigned perm, off_t offset);
 
-#ifndef AARCH64_PORT_STUB
 bool unmap_address(void* buf, void *addr, size_t size);
 void add_mapping(void *buf_addr, void* addr, hw_ptep ptep);
 bool remove_mapping(void *buf_addr, void *paddr, hw_ptep ptep);
@@ -174,9 +170,26 @@ bool lookup_mapping(void *paddr, hw_ptep ptep);
 void tlb_flush();
 void clear_pte(hw_ptep ptep);
 void clear_pte(std::pair<void* const, hw_ptep>& pair);
-#endif /* !AARCH64_PORT_STUB */
 
 phys virt_to_phys(void *virt);
+
+template <typename OutputFunc>
+inline
+void virt_to_phys(void* vaddr, size_t len, OutputFunc out)
+{
+    if (CONF_debug_memory && vaddr >= debug_base) {
+        while (len) {
+            auto next = std::min(align_down(vaddr + page_size, page_size), vaddr + len);
+            size_t delta = static_cast<char*>(next) - static_cast<char*>(vaddr);
+            out(virt_to_phys(vaddr), delta);
+            vaddr = next;
+            len -= delta;
+        }
+    } else {
+        out(virt_to_phys(vaddr), len);
+    }
+}
+
 void* phys_to_virt(phys pa);
 
 template <typename T>
@@ -200,7 +213,8 @@ bool is_page_aligned(void* addr)
 void linear_map(void* virt, phys addr, size_t size,
                 size_t slop = mmu::page_size);
 void free_initial_memory_range(uintptr_t addr, size_t size);
-void switch_to_runtime_page_table();
+void switch_to_runtime_page_tables();
+
 void set_nr_page_sizes(unsigned nr);
 
 void vpopulate(void* addr, size_t size);
@@ -224,4 +238,4 @@ unsigned clear_ptes(I start,  I end)
 
 }
 
-#endif
+#endif /* MMU_HH */

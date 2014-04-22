@@ -15,7 +15,6 @@
 #include <iterator>
 #include "libc/signal.hh"
 #include <osv/align.hh>
-#include <osv/interrupt.hh>
 #include <osv/ilog2.hh>
 #include <osv/prio.hh>
 #include <safe-ptr.hh>
@@ -74,6 +73,9 @@ vma_list_type vma_list;
 // A fairly coarse-grained mutex serializing modifications to both
 // vma_list and the page table itself.
 mutex vma_list_mutex;
+// A mutex serializing modifications to the high part of the page table
+// (linear map, etc.) which are not part of vma_list.
+mutex page_table_high_mutex;
 
 hw_ptep follow(pt_element pte)
 {
@@ -159,16 +161,16 @@ void allocate_intermediate_level(hw_ptep ptep)
 bool change_perm(hw_ptep ptep, unsigned int perm)
 {
     pt_element pte = ptep.read();
-    unsigned int old = (pte.present() ? perm_read : 0) |
-            (pte.writable() ? perm_write : 0) |
-            (!pte.nx() ? perm_exec : 0);
+    unsigned int old = (pte.valid() ? perm_read : 0) |
+        (pte.writable() ? perm_write : 0) |
+        (pte.executable() ? perm_exec : 0);
     // Note: in x86, if the present bit (0x1) is off, not only read is
     // disallowed, but also write and exec. So in mprotect, if any
     // permission is requested, we must also grant read permission.
     // Linux does this too.
-    pte.set_present(perm);
+    pte.set_valid(perm);
     pte.set_writable(perm & perm_write);
-    pte.set_nx(!(perm & perm_exec));
+    pte.set_executable(perm & perm_exec);
     ptep.write(pte);
 
     return old & ~perm;
@@ -201,7 +203,7 @@ struct page_allocator {
 
 void debug_count_ptes(pt_element pte, int level, size_t &nsmall, size_t &nhuge)
 {
-    if (level<4 && !pte.present()){
+    if (level<4 && !pte.valid()){
         // nothing
     } else if (pte.large()) {
         nhuge++;
@@ -213,44 +215,6 @@ void debug_count_ptes(pt_element pte, int level, size_t &nsmall, size_t &nhuge)
             debug_count_ptes(pt.at(i).read(), level-1, nsmall, nhuge);
         }
     }
-}
-
-
-void tlb_flush_this_processor()
-{
-    // TODO: we can use page_table_root instead of read_cr3(), can be faster
-    // when shadow page tables are used.
-    processor::write_cr3(processor::read_cr3());
-}
-
-// tlb_flush() does TLB flush on *all* processors, not returning before all
-// processors confirm flushing their TLB. This is slow, but necessary for
-// correctness so that, for example, after mprotect() returns, no thread on
-// no cpu can write to the protected page.
-mutex tlb_flush_mutex;
-sched::thread_handle tlb_flush_waiter;
-std::atomic<int> tlb_flush_pendingconfirms;
-
-inter_processor_interrupt tlb_flush_ipi{[] {
-        tlb_flush_this_processor();
-        if (tlb_flush_pendingconfirms.fetch_add(-1) == 1) {
-            tlb_flush_waiter.wake();
-        }
-}};
-
-void tlb_flush()
-{
-    tlb_flush_this_processor();
-    if (sched::cpus.size() <= 1)
-        return;
-    std::lock_guard<mutex> guard(tlb_flush_mutex);
-    tlb_flush_waiter.reset(*sched::thread::current());
-    tlb_flush_pendingconfirms.store((int)sched::cpus.size() - 1);
-    tlb_flush_ipi.send_allbutself();
-    sched::thread::wait_until([] {
-            return tlb_flush_pendingconfirms.load() == 0;
-    });
-    tlb_flush_waiter.clear();
 }
 
 void clamp(uintptr_t& vstart1, uintptr_t& vend1,
@@ -273,8 +237,6 @@ void set_nr_page_sizes(unsigned nr)
 {
     nr_page_sizes = nr;
 }
-
-pt_element page_table_root;
 
 constexpr size_t page_size_level(unsigned level)
 {
@@ -348,7 +310,7 @@ template<typename PageOp>
         void map_range(uintptr_t vma_start, uintptr_t vstart, size_t size, PageOp& page_mapper, size_t slop = page_size)
 {
     map_level<PageOp, 4> pt_mapper(vma_start, vstart, size, page_mapper, slop);
-    pt_mapper(hw_ptep::force(&page_table_root));
+    pt_mapper(hw_ptep::force(mmu::get_root_pt(vstart)));
 }
 
 template<typename PageOp, int ParentLevel> class map_level {
@@ -378,7 +340,7 @@ private:
         pt_mapper(ptep, base_virt);
     }
     void operator()(hw_ptep parent, uintptr_t base_virt = 0) {
-        if (!parent.read().present()) {
+        if (!parent.read().valid()) {
             if (!page_mapper.allocate_intermediate()) {
                 return;
             }
@@ -573,7 +535,7 @@ struct tlb_gather {
         if (!nr_pages) {
             return;
         }
-        tlb_flush();
+        mmu::flush_tlb_all();
         for (auto i = 0u; i < nr_pages; ++i) {
             auto&& tp = pages[i];
             if (tp.size == page_size) {
@@ -757,7 +719,7 @@ template<typename T> ulong operate_range(T mapper, void *vma_start, void *start,
     // split_large_page() and other specific places where we modify specific
     // page table entries.
     if (mapper.tlb_flush_needed()) {
-        tlb_flush();
+        mmu::flush_tlb_all();
     }
     mapper.finalize();
     return mapper.account_results();
@@ -1066,9 +1028,15 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     return start;
 }
 
+inline bool in_vma_range(void* addr)
+{
+    return reinterpret_cast<long>(addr) >= 0;
+}
+
 void vpopulate(void* addr, size_t size)
 {
-    WITH_LOCK(vma_list_mutex) {
+    assert(!in_vma_range(addr));
+    WITH_LOCK(page_table_high_mutex) {
         initialized_anonymous_page_provider map;
         operate_range(populate<>(&map, perm_rwx), addr, size);
     }
@@ -1076,7 +1044,8 @@ void vpopulate(void* addr, size_t size)
 
 void vdepopulate(void* addr, size_t size)
 {
-    WITH_LOCK(vma_list_mutex) {
+    assert(!in_vma_range(addr));
+    WITH_LOCK(page_table_high_mutex) {
         initialized_anonymous_page_provider map;
         operate_range(unpopulate<>(&map), addr, size);
     }
@@ -1084,7 +1053,8 @@ void vdepopulate(void* addr, size_t size)
 
 void vcleanup(void* addr, size_t size)
 {
-    WITH_LOCK(vma_list_mutex) {
+    assert(!in_vma_range(addr));
+    WITH_LOCK(page_table_high_mutex) {
         cleanup_intermediate_pages cleaner;
         map_range(reinterpret_cast<uintptr_t>(addr), reinterpret_cast<uintptr_t>(addr), size,
                 cleaner, huge_page_size);
@@ -1128,7 +1098,7 @@ bool unmap_address(void *buf_addr, void *addr, size_t size)
         }
         last = refs ? fs_buf_put(buf_addr, refs) : false;
     }
-    tlb_flush();
+    mmu::flush_tlb_all();
     return last;
 }
 
@@ -1211,39 +1181,27 @@ bool isreadable(void *addr, size_t size)
     return true;
 }
 
-namespace {
-
-uintptr_t align_down(uintptr_t ptr)
-{
-    return ptr & ~(page_size - 1);
-}
-
-uintptr_t align_up(uintptr_t ptr)
-{
-    return align_down(ptr + page_size - 1);
-}
-
-}
-
-bool access_fault(vma& vma, unsigned long error_code)
+bool access_fault(vma& vma, unsigned int error_code)
 {
     auto perm = vma.perm();
-    if (error_code & page_fault_insn) {
+    if (mmu::is_page_fault_insn(error_code)) {
         return !(perm & perm_exec);
     }
-    if (error_code & page_fault_write) {
+
+    if (mmu::is_page_fault_write(error_code)) {
         return !(perm & perm_write);
     }
+
     return !(perm & perm_read);
 }
 
-TRACEPOINT(trace_mmu_vm_fault, "addr=%p, error_code=%x", uintptr_t, u16);
-TRACEPOINT(trace_mmu_vm_fault_sigsegv, "addr=%p, error_code=%x", uintptr_t, u16);
-TRACEPOINT(trace_mmu_vm_fault_ret, "addr=%p, error_code=%x", uintptr_t, u16);
+TRACEPOINT(trace_mmu_vm_fault, "addr=%p, error_code=%x", uintptr_t, unsigned int);
+TRACEPOINT(trace_mmu_vm_fault_sigsegv, "addr=%p, error_code=%x", uintptr_t, unsigned int);
+TRACEPOINT(trace_mmu_vm_fault_ret, "addr=%p, error_code=%x", uintptr_t, unsigned int);
 
 void vm_sigsegv(uintptr_t addr, exception_frame* ef)
 {
-    auto pc = reinterpret_cast<void*>(ef->rip);
+    void *pc = ef->get_pc();
     if (pc >= text_start && pc < text_end) {
         abort("page fault outside application, addr %lx", addr);
     }
@@ -1252,22 +1210,22 @@ void vm_sigsegv(uintptr_t addr, exception_frame* ef)
 
 void vm_fault(uintptr_t addr, exception_frame* ef)
 {
-    trace_mmu_vm_fault(addr, ef->error_code);
-    addr = align_down(addr);
+    trace_mmu_vm_fault(addr, ef->get_error());
+    addr = align_down(addr, mmu::page_size);
     WITH_LOCK(vma_list_mutex) {
         auto vma = vma_list.find(addr_range(addr, addr+1), vma::addr_compare());
-        if (vma == vma_list.end() || access_fault(*vma, ef->error_code)) {
+        if (vma == vma_list.end() || access_fault(*vma, ef->get_error())) {
             vm_sigsegv(addr, ef);
-            trace_mmu_vm_fault_sigsegv(addr, ef->error_code);
+            trace_mmu_vm_fault_sigsegv(addr, ef->get_error());
             return;
         }
         vma->fault(addr, ef);
     }
-    trace_mmu_vm_fault_ret(addr, ef->error_code);
+    trace_mmu_vm_fault_ret(addr, ef->get_error());
 }
 
 vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops)
-    : _range(align_down(range.start()), align_up(range.end()))
+    : _range(align_down(range.start(), mmu::page_size), align_up(range.end(), mmu::page_size))
     , _perm(perm)
     , _flags(flags)
     , _map_dirty(map_dirty)
@@ -1281,7 +1239,7 @@ vma::~vma()
 
 void vma::set(uintptr_t start, uintptr_t end)
 {
-    _range = addr_range(align_down(start), align_up(end));
+    _range = addr_range(align_down(start, mmu::page_size), align_up(end, mmu::page_size));
 }
 
 void vma::protect(unsigned perm)
@@ -1348,17 +1306,18 @@ bool vma::map_dirty()
 
 void vma::fault(uintptr_t addr, exception_frame *ef)
 {
-    auto hp_start = ::align_up(_range.start(), huge_page_size);
-    auto hp_end = ::align_down(_range.end(), huge_page_size);
+    auto hp_start = align_up(_range.start(), huge_page_size);
+    auto hp_end = align_down(_range.end(), huge_page_size);
     size_t size;
     if (!has_flags(mmap_jvm_balloon|mmap_small) && (hp_start <= addr && addr < hp_end)) {
-        addr = ::align_down(addr, huge_page_size);
+        addr = align_down(addr, huge_page_size);
         size = huge_page_size;
     } else {
         size = page_size;
     }
 
-    auto total = populate_vma<account_opt::yes>(this, (void*)addr, size, ef->error_code & page_fault_write);
+    auto total = populate_vma<account_opt::yes>(this, (void*)addr, size,
+        mmu::is_page_fault_write(ef->get_error()));
 
     if (_flags & mmap_jvm_heap) {
         memory::stats::on_jvm_heap_alloc(total);
@@ -1500,15 +1459,15 @@ jvm_balloon_vma::~jvm_balloon_vma()
     if (_effective_jvm_addr) {
         // Can't just use size(), because although rare, the source and destination can
         // have different alignments
-        auto end = ::align_down(_effective_jvm_addr + balloon_size, balloon_alignment);
-        auto s = end - ::align_up(_effective_jvm_addr, balloon_alignment);
+        auto end = align_down(_effective_jvm_addr + balloon_size, balloon_alignment);
+        auto s = end - align_up(_effective_jvm_addr, balloon_alignment);
         mmu::map_jvm(_effective_jvm_addr, s, mmu::huge_page_size, _balloon);
     }
 }
 
 ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
 {
-    auto addr = ::align_up(jvm_addr, align);
+    auto addr = align_up(jvm_addr, align);
     auto start = reinterpret_cast<uintptr_t>(addr);
 
     vma* v;
@@ -1697,7 +1656,7 @@ std::unique_ptr<file_vma> shm_file::mmap(addr_range range, unsigned flags, unsig
 
 mmupage shm_file::get_page(uintptr_t offset, size_t size, hw_ptep ptep, bool write, bool shared)
 {
-    uintptr_t hp_off = ::align_down(offset, huge_page_size);
+    uintptr_t hp_off = align_down(offset, huge_page_size);
     void *addr;
 
     assert((size != huge_page_size) || (hp_off == offset));
@@ -1746,11 +1705,6 @@ void free_initial_memory_range(uintptr_t addr, size_t size)
     memory::free_initial_memory_range(phys_cast<void>(addr), size);
 }
 
-void switch_to_runtime_page_table()
-{
-    processor::write_cr3(page_table_root.next_pt_addr());
-}
-
 error mprotect(const void *addr, size_t len, unsigned perm)
 {
     std::lock_guard<mutex> guard(vma_list_mutex);
@@ -1766,6 +1720,7 @@ error munmap(const void *addr, size_t length)
 {
     std::lock_guard<mutex> guard(vma_list_mutex);
 
+    length = align_up(length, mmu::page_size);
     if (!ismapped(addr, length)) {
         return make_error(EINVAL);
     }
@@ -1786,7 +1741,7 @@ error msync(const void* addr, size_t length, int flags)
 
 error mincore(const void *addr, size_t length, unsigned char *vec)
 {
-    char *end = ::align_up((char *)addr + length, page_size);
+    char *end = align_up((char *)addr + length, page_size);
     char tmp;
     std::lock_guard<mutex> guard(vma_list_mutex);
     if (!is_linear_mapped(addr, length) && !ismapped(addr, length)) {

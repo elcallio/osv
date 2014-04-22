@@ -132,7 +132,7 @@ configuration += -DNDEBUG
 endif
 
 ifeq ($(arch),x64)
-arch-cflags = -msse4.1
+arch-cflags = -msse2
 endif
 
 ifeq ($(arch),aarch64)
@@ -209,6 +209,7 @@ boost-tests += tests/tst-stat.so
 boost-tests += tests/tst-wait-for.so
 boost-tests += tests/tst-bsd-tcp1.so
 boost-tests += tests/tst-async.so
+boost-tests += tests/tst-rcu-list.so
 
 java_tests := tests/hello/Hello.class
 
@@ -227,6 +228,8 @@ tests += tests/tst-mmap-file.so
 tests += tests/misc-mmap-big-file.so
 tests += tests/tst-mmap.so
 tests += tests/tst-huge.so
+tests += tests/tst-elf-permissions.so
+tests/tst-elf-permissions.so: COMMON += -Wl,-z,relro
 tests += tests/misc-mutex.so
 tests += tests/misc-sockets.so
 tests += tests/tst-condvar.so
@@ -245,6 +248,7 @@ tests += tests/tst-sleep.so
 tests += tests/tst-resolve.so
 tests += tests/tst-except.so
 tests += tests/misc-tcp-sendonly.so
+tests += tests/tst-tcp-nbwrite.so
 tests += tests/misc-tcp-hash-srv.so
 tests += tests/misc-loadbalance.so
 tests += tests/misc-scheduler.so
@@ -269,6 +273,8 @@ tests += tests/tst-hello.so
 tests += tests/tst-concurrent-init.so
 tests += tests/tst-ring-spsc-wraparound.so
 tests += tests/tst-shm.so
+tests += tests/tst-align.so
+tests += tests/misc-tcp-close-without-reading.so
 
 tests/hello/Hello.class: javabase=tests/hello
 
@@ -638,6 +644,7 @@ libtsm += drivers/libtsm/tsm_vte.o
 libtsm += drivers/libtsm/tsm_vte_charsets.o
 
 drivers := $(bsd) $(solaris)
+drivers += core/mmu.o
 drivers += drivers/console.o
 drivers += arch/$(arch)/debug-console.o
 drivers += drivers/clock.o
@@ -649,7 +656,6 @@ drivers += java/jvm_balloon.o
 ifeq ($(arch),x64)
 drivers += $(libtsm)
 drivers += drivers/vga.o drivers/kbd.o drivers/isa-serial.o
-drivers += core/mmu.o
 drivers += core/interrupt.o
 drivers += core/pvclock-abi.o
 drivers += drivers/device.o
@@ -687,12 +693,16 @@ objects += arch/$(arch)/backtrace.o
 objects += arch/$(arch)/smp.o
 objects += arch/$(arch)/elf-dl.o
 objects += arch/$(arch)/entry.o
+objects += arch/$(arch)/mmu.o
+
+ifeq ($(arch),aarch64)
+objects += arch/$(arch)/arm-clock.o
+endif
 
 ifeq ($(arch),x64)
 objects += arch/x64/dump.o
 objects += arch/x64/exceptions.o
 objects += arch/x64/ioapic.o
-objects += arch/x64/mmu.o
 objects += arch/x64/math.o
 objects += arch/x64/apic.o
 objects += arch/x64/apic-clock.o
@@ -701,7 +711,6 @@ objects += arch/x64/entry-xen.o
 objects += arch/x64/xen.o
 objects += arch/x64/xen_intr.o
 objects += $(acpi)
-objects += core/pagecache.o
 endif # x64
 
 objects += core/spinlock.o
@@ -711,6 +720,7 @@ objects += core/semaphore.o
 objects += core/condvar.o
 objects += core/debug.o
 objects += core/rcu.o
+objects += core/pagecache.o
 objects += core/mempool.o
 objects += core/alloctracker.o
 objects += core/printf.o
