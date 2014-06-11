@@ -24,7 +24,7 @@
 	ignore = dirty
 [submodule "mgmt"]
 	path = mgmt
-	url = ../../cloudius-systems/mgmt.git
+	url = ../../elcallio/mgmt.git
 	ignore = dirty
 [submodule "apps"]
 	path = apps
