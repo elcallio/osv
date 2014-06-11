@@ -6,71 +6,110 @@
  */
 
 #include "isa-serial.hh"
-#include <string.h>
 
 namespace console {
 
-void IsaSerialConsole::write(const char *str, size_t len)
+// UART registers, offsets to ioport:
+enum regs {
+    IER = 1,    // Interrupt Enable Register
+    FCR = 2,    // FIFO Control Register
+    LCR = 3,    // Line Control Register
+    MCR = 4,    // Modem Control Register
+    LSR = 5,    // Line Control Register
+    MSR = 6,    // Modem Status Register
+    SCR = 7,    // Scratch Register
+    DLL = 0,    // Divisor Latch LSB Register
+    DLM = 1,    // Divisor Latch MSB Register
+};
+
+enum lcr {
+    // When bit 7 (DLAB) of LCR is set to 1, the two registers 0 and 1
+    // change their meaning and become two bytes controlling the baud rate
+    DLAB     = 0x80,    // Divisor Latch Access Bit in LCR register
+    LEN_8BIT = 3,
+};
+
+// Various bits of the Line Status Register
+enum lsr {
+    RECEIVE_DATA_READY  = 0x1,
+    OVERRUN             = 0x2,
+    PARITY_ERROR        = 0x4,
+    FRAME_ERROR         = 0x8,
+    BREAK_INTERRUPT     = 0x10,
+    TRANSMIT_HOLD_EMPTY = 0x20,
+    TRANSMIT_EMPTY      = 0x40,
+    FIFO_ERROR          = 0x80,
+};
+
+// Various bits of the Modem Control Register
+enum mcr {
+    DTR                 = 0x1,
+    RTS                 = 0x2,
+    AUX_OUTPUT_1        = 0x4,
+    AUX_OUTPUT_2        = 0x8,
+    LOOPBACK_MODE       = 0x16,
+};
+
+void isa_serial_console::write(const char *str, size_t len)
 {
     while (len-- > 0)
-        writeByte(*str++);
+        putchar(*str++);
 }
 
-bool IsaSerialConsole::input_ready()
+bool isa_serial_console::input_ready()
 {
-    u8 lsr = pci::inb(ioport + LSR_ADDRESS);
-    return lsr & LSR_RECEIVE_DATA_READY;
+    u8 val = pci::inb(ioport + regs::LSR);
+    return val & lsr::RECEIVE_DATA_READY;
 }
 
-char IsaSerialConsole::readch()
+char isa_serial_console::readch()
 {
-    u8 lsr;
+    u8 val;
     char letter;
 
     do {
-        lsr = pci::inb(ioport + LSR_ADDRESS);
-    } while (!(lsr & (LSR_RECEIVE_DATA_READY | LSR_OVERRUN | LSR_PARITY_ERROR | LSR_FRAME_ERROR)));
+        val = pci::inb(ioport + regs::LSR);
+    } while (!(val & (lsr::RECEIVE_DATA_READY | lsr::OVERRUN | lsr::PARITY_ERROR | lsr::FRAME_ERROR)));
 
     letter = pci::inb(ioport);
 
     return letter;
 }
 
-void IsaSerialConsole::writeByte(const char letter)
+void isa_serial_console::putchar(const char ch)
 {
-	u8 lsr;
+    u8 val;
 
-	do {
-		lsr = pci::inb(ioport + LSR_ADDRESS);
-	} while (!(lsr & LSR_TRANSMIT_HOLD_EMPTY));
+    do {
+        val = pci::inb(ioport + regs::LSR);
+    } while (!(val & lsr::TRANSMIT_HOLD_EMPTY));
 
-	pci::outb(letter, ioport);
+    pci::outb(ch, ioport);
 }
 
-void IsaSerialConsole::reset() {
+void isa_serial_console::reset() {
     // Set the UART speed to to 115,200 bps, This is done by writing 1,0 to
     // Divisor Latch registers, but to access these we need to temporarily
     // set the Divisor Latch Access Bit (DLAB) on the LSR register, because
     // the UART has fewer ports than registers...
-    lcr = LCR_8BIT;
-    pci::outb(lcr | LCR_DLAB, ioport + LCR_ADDRESS);
-    pci::outb(1, ioport + DLL_ADDRESS);
-    pci::outb(0, ioport + DLM_ADDRESS);
-    pci::outb(lcr, ioport + LCR_ADDRESS);
+    pci::outb(lcr::LEN_8BIT | lcr::DLAB, ioport + regs::LCR);
+    pci::outb(1, ioport + regs::DLL);
+    pci::outb(0, ioport + regs::DLM);
+    pci::outb(lcr::LEN_8BIT, ioport + regs::LCR);
 
     //  interrupt threshold
-    pci::outb(0, ioport + FCR_ADDRESS);
+    pci::outb(0, ioport + regs::FCR);
 
     // enable interrupts
-    pci::outb(1, ioport + IER_ADDRESS);
+    pci::outb(1, ioport + regs::IER);
 
     // Most physical UARTs need the MCR AUX_OUTPUT_2 bit set to 1 for
     // interrupts to be generated. QEMU doesn't bother checking this
     // bit, but interestingly VMWare does, so we must set it.
-    pci::outb(MCR_AUX_OUTPUT_2, ioport + MCR_ADDRESS);
+    pci::outb(mcr::AUX_OUTPUT_2, ioport + regs::MCR);
 }
 
-void IsaSerialConsole::dev_start() {
+void isa_serial_console::dev_start() {
     _irq = new gsi_edge_interrupt(4, [&] { _thread->wake(); });
     reset();
 }

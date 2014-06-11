@@ -93,38 +93,6 @@ uid_t geteuid()
     return 0;
 }
 
-int getpwuid_r(uid_t uid, struct passwd *pwd,
-               char *buf, size_t buflen, struct passwd **result)
-{
-    auto alloc = [&](int n) { auto tmp = buf; buf += n; return tmp; };
-    auto save = [&](const char* s) { return strcpy(alloc(strlen(s) + 1), s); };
-
-    pwd->pw_name = save("osv");
-    pwd->pw_passwd = save("*");
-    pwd->pw_uid = 0;
-    pwd->pw_gid = 0;
-    pwd->pw_gecos = save("");
-    pwd->pw_dir = save("");
-    pwd->pw_shell = save("");
-    *result = pwd;
-    return 0;
-}
-
-struct passwd* getpwuid(uid_t uid)
-{
-    static struct passwd ret;
-    static char buf[300];
-    struct passwd *p;
-    int e;
-
-    e = getpwuid_r(uid, &ret, buf, sizeof(buf), &p);
-    if (e == 0) {
-        return &ret;
-    } else {
-        return libc_error_ptr<passwd>(e);
-    }
-}
-
 int sched_yield()
 {
     sched::thread::yield();
@@ -200,6 +168,39 @@ int tcflush(int fd, int what)
 speed_t cfgetospeed(const termios *p)
 {
     return p->__c_ospeed;
+}
+
+int cfsetospeed(struct termios *tio, speed_t speed)
+{
+	if (speed & ~CBAUD) {
+		errno = EINVAL;
+		return -1;
+	}
+	tio->c_cflag &= ~CBAUD;
+	tio->c_cflag |= speed;
+	return 0;
+}
+
+int cfsetispeed(struct termios *tio, speed_t speed)
+{
+	return speed ? cfsetospeed(tio, speed) : 0;
+}
+weak_alias(cfsetospeed, cfsetspeed);
+
+int tcsendbreak(int fd, int dur)
+{
+	return ioctl(fd, TCSBRK, 0);
+}
+
+void cfmakeraw(struct termios *t)
+{
+	t->c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON);
+	t->c_oflag &= ~OPOST;
+	t->c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
+	t->c_cflag &= ~(CSIZE|PARENB);
+	t->c_cflag |= CS8;
+	t->c_cc[VMIN] = 1;
+	t->c_cc[VTIME] = 0;
 }
 
 extern "C" {

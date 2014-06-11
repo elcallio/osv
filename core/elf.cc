@@ -23,6 +23,8 @@
 #include <osv/sched.hh>
 #include <osv/trace.hh>
 
+#include "arch.hh"
+
 TRACEPOINT(trace_elf_load, "%s", const char *);
 TRACEPOINT(trace_elf_unload, "%s", const char *);
 TRACEPOINT(trace_elf_lookup, "%s", const char *);
@@ -479,34 +481,9 @@ void object::relocate_rela()
         u32 type = info & 0xffffffff;
         void *addr = _base + p->r_offset;
         auto addend = p->r_addend;
-        switch (type) {
-        case R_X86_64_NONE:
-            break;
-        case R_X86_64_64:
-            *static_cast<void**>(addr) = symbol(sym).relocated_addr() + addend;
-            break;
-        case R_X86_64_RELATIVE:
-            *static_cast<void**>(addr) = _base + addend;
-            break;
-        case R_X86_64_JUMP_SLOT:
-        case R_X86_64_GLOB_DAT:
-            *static_cast<void**>(addr) = symbol(sym).relocated_addr();
-            break;
-        case R_X86_64_DPTMOD64:
-            if (sym == STN_UNDEF) {
-                *static_cast<u64*>(addr) = 0;
-            } else {
-                *static_cast<u64*>(addr) = symbol(sym).obj->_module_index;
-            }
-            break;
-        case R_X86_64_DTPOFF64:
-            *static_cast<u64*>(addr) = symbol(sym).symbol->st_value;
-            break;
-        case R_X86_64_TPOFF64:
-            *static_cast<u64*>(addr) = symbol(sym).symbol->st_value - get_tls_size();
-            break;
-        default:
-            debug("unknown relocation type %d\n", type);
+
+        if (!arch_relocate_rela(type, sym, addr, addend)) {
+            debug_early_u64("relocate_rela(): unknown relocation type ", type);
             abort();
         }
     }
@@ -523,6 +500,9 @@ void object::relocate_pltgot()
         // .GOT.PLT entries point not to the .PLT but to a prelinked address
         // of the actual function. We'll need to return the link to the .PLT.
         // The prelinker saved us in pltgot[1] the address of .plt + 0x16.
+#ifdef AARCH64_PORT_STUB
+        assert(0);
+#endif /* AARCH64_PORT_STUB */
         original_plt = static_cast<void*>(_base + (u64)pltgot[1]);
     }
     bool bind_now = dynamic_exists(DT_BIND_NOW);
@@ -532,13 +512,16 @@ void object::relocate_pltgot()
     for (auto p = rel; p < rel + nrel; ++p) {
         auto info = p->r_info;
         u32 type = info & 0xffffffff;
-        assert(type == R_X86_64_JUMP_SLOT);
+        assert(type == ARCH_JUMP_SLOT);
         void *addr = _base + p->r_offset;
         if (bind_now) {
             // If on-load binding is requested (instead of the default lazy
             // binding), resolve all the PLT entries now.
-            u32 idx = info >> 32;
-            *static_cast<void**>(addr) = symbol(idx).relocated_addr();
+            u32 sym = info >> 32;
+            if (!arch_relocate_jump_slot(sym, addr, p->r_addend)) {
+                debug_early("relocate_pltgot(): failed jump slot relocation\n");
+                abort();
+            }
         } else if (original_plt) {
             // Restore the link to the original plt.
             // We know the JUMP_SLOT entries are in plt order, and that
@@ -550,9 +533,12 @@ void object::relocate_pltgot()
             *static_cast<u64*>(addr) += reinterpret_cast<u64>(_base);
         }
     }
-    // PLTGOT resolution has a special calling convention, with the symbol
-    // index and some word pushed on the stack, so we need an assembly
-    // stub to convert it back to the standard calling convention.
+
+    // PLTGOT resolution has a special calling convention,
+    // for x64 the symbol index and some word is pushed on the stack,
+    // for AArch64 &pltgot[n] and LR are pushed on the stack,
+    // so we need an assembly stub to convert it back to the
+    // standard calling convention.
     pltgot[1] = this;
     pltgot[2] = reinterpret_cast<void*>(__elf_resolve_pltgot);
 }
@@ -564,10 +550,19 @@ void* object::resolve_pltgot(unsigned index)
     auto info = slot.r_info;
     u32 sym = info >> 32;
     u32 type = info & 0xffffffff;
-    assert(type == R_X86_64_JUMP_SLOT);
+    assert(type == ARCH_JUMP_SLOT);
     void *addr = _base + slot.r_offset;
-    auto ret = *static_cast<void**>(addr) = symbol(sym).relocated_addr();
-    return ret;
+    auto sm = symbol(sym);
+    WITH_LOCK(_used_by_resolve_plt_got_mutex) {
+        _used_by_resolve_plt_got.insert(sm.obj->shared_from_this());
+    }
+
+    if (!arch_relocate_jump_slot(sym, addr, slot.r_addend)) {
+        debug_early("resolve_pltgot(): failed jump slot relocation\n");
+        abort();
+    }
+
+    return *static_cast<void**>(addr);
 }
 
 void object::relocate()
@@ -750,7 +745,7 @@ static std::string dirname(std::string path)
     return path.substr(0, pos);
 }
 
-void object::load_needed()
+void object::load_needed(std::vector<std::shared_ptr<object>>& loaded_objects)
 {
     std::vector<std::string> rpath;
     if (dynamic_exists(DT_RPATH)) {
@@ -760,7 +755,7 @@ void object::load_needed()
     }
     auto needed = dynamic_str_array(DT_NEEDED);
     for (auto lib : needed) {
-        auto obj = _prog.get_library(lib, rpath);
+        auto obj = _prog.load_object(lib, rpath, loaded_objects);
         if (obj) {
             // Keep a reference to the needed object, so it won't be
             // unloaded until this object is unloaded.
@@ -842,7 +837,7 @@ program::program(void* addr)
 {
     assert(!s_program);
     s_program = this;
-    _core = make_shared<memory_image>(*this, reinterpret_cast<void*>(0x200000));
+    _core = make_shared<memory_image>(*this, (void*)ELF_IMAGE_START);
     assert(_core->module_index() == core_module_index);
     _core->load_segments();
     // Our kernel already supplies the features of a bunch of traditional
@@ -850,13 +845,20 @@ program::program(void* addr)
     static const auto supplied_modules = {
           "libc.so.6",
           "libm.so.6",
+#ifdef __x86_64__
           "ld-linux-x86-64.so.2",
+          "libboost_system-mt.so.1.53.0",
+          "libboost_program_options-mt.so.1.53.0",
+#endif /* __x86_64__ */
+#ifdef __aarch64__
+          "ld-linux-aarch64.so.1",
+          "libboost_system-mt.so.1.55.0",
+          "libboost_program_options-mt.so.1.55.0",
+#endif /* __aarch64__ */
           "libpthread.so.0",
           "libdl.so.2",
           "librt.so.1",
           "libstdc++.so.6",
-          "libboost_system-mt.so.1.53.0",
-          "libboost_program_options-mt.so.1.53.0",
     };
     auto ml = new modules_list();
     ml->objects.push_back(_core.get());
@@ -891,12 +893,17 @@ static std::string canonicalize(std::string p)
     }
 }
 
+// This is the part of program::get_library() which loads an object and all
+// its dependencies, but doesn't yet run the objects' init functions. We can
+// only do this after loading all the dependent objects, as we need to run the
+// init functions of the deepest needed object first, yet it may use symbols
+// from the shalower objects (as those are first in the search path).
+// So while loading the objects, we just collect a list of them, and
+// get_library() will run the init functions later.
 std::shared_ptr<elf::object>
-program::get_library(std::string name, std::vector<std::string> extra_path)
+program::load_object(std::string name, std::vector<std::string> extra_path,
+        std::vector<std::shared_ptr<object>> &loaded_objects)
 {
-    // Note: this lock can be recursive (get_library calls load_needed which
-    // calls get_library again).
-    SCOPE_LOCK(_mutex);
     fileref f;
     if (name.find('/') == name.npos) {
         std::vector<std::string> search_path;
@@ -945,17 +952,35 @@ program::get_library(std::string name, std::vector<std::string> extra_path)
         ef->load_segments();
         _next_alloc = ef->end();
         add_debugger_obj(ef.get());
-        ef->load_needed();
+        loaded_objects.push_back(ef);
+        ef->load_needed(loaded_objects);
         ef->relocate();
         ef->fix_permissions();
-        ef->run_init_funcs();
-        ef->setprivate(false);
         _files[name] = ef;
         _files[ef->soname()] = ef;
         return ef;
     } else {
         return std::shared_ptr<object>();
     }
+}
+
+std::shared_ptr<object>
+program::get_library(std::string name, std::vector<std::string> extra_path)
+{
+    SCOPE_LOCK(_mutex);
+    std::vector<std::shared_ptr<object>> loaded_objects;
+    auto ret = load_object(name, extra_path, loaded_objects);
+    // After loading the object and all its needed objects, run these objects'
+    // init functions in reverse order (so those of deepest needed object runs
+    // first) and finally make the loaded objects visible in search order.
+    auto size = loaded_objects.size();
+    for (int i = size - 1; i >= 0; i--) {
+        loaded_objects[i]->run_init_funcs();
+    }
+    for (unsigned i = 0; i < size; i++) {
+        loaded_objects[i]->setprivate(false);
+    }
+    return ret;
 }
 
 void program::remove_object(object *ef)
@@ -1074,6 +1099,26 @@ program* get_program()
     return s_program;
 }
 
+const Elf64_Sym *init_dyn_tabs::lookup(u32 sym)
+{
+    auto nbucket = this->hashtab[0];
+    auto buckets = hashtab + 2;
+    auto chain = buckets + nbucket;
+    auto name = strtab + symtab[sym].st_name;
+
+    for (auto ent = buckets[elf64_hash(name) % nbucket];
+         ent != STN_UNDEF;
+         ent = chain[ent]) {
+
+        auto &sym = symtab[ent];
+        if (strcmp(name, &strtab[sym.st_name]) == 0) {
+            return &sym;
+        }
+    }
+
+    return nullptr;
+};
+
 init_table get_init(Elf64_Ehdr* header)
 {
     void* pbase = static_cast<void*>(header);
@@ -1090,13 +1135,14 @@ init_table get_init(Elf64_Ehdr* header)
         if (phdr->p_type == PT_DYNAMIC) {
             auto dyn = reinterpret_cast<Elf64_Dyn*>(phdr->p_vaddr);
             unsigned ndyn = phdr->p_memsz / sizeof(*dyn);
+            ret.dyn_tabs = {
+                .symtab = nullptr, .hashtab = nullptr, .strtab = nullptr,
+            };
             const Elf64_Rela* rela = nullptr;
             const Elf64_Rela* jmp = nullptr;
-            const Elf64_Sym* symtab = nullptr;
-            const Elf64_Word* hashtab = nullptr;
-            const char* strtab = nullptr;
             unsigned nrela = 0;
             unsigned njmp = 0;
+
             for (auto d = dyn; d < dyn + ndyn; ++d) {
                 switch (d->d_tag) {
                 case DT_INIT_ARRAY:
@@ -1112,13 +1158,13 @@ init_table get_init(Elf64_Ehdr* header)
                     nrela = d->d_un.d_val / sizeof(*rela);
                     break;
                 case DT_SYMTAB:
-                    symtab = reinterpret_cast<const Elf64_Sym*>(d->d_un.d_ptr);
+                    ret.dyn_tabs.symtab = reinterpret_cast<const Elf64_Sym*>(d->d_un.d_ptr);
                     break;
                 case DT_HASH:
-                    hashtab = reinterpret_cast<const Elf64_Word*>(d->d_un.d_ptr);
+                    ret.dyn_tabs.hashtab = reinterpret_cast<const Elf64_Word*>(d->d_un.d_ptr);
                     break;
                 case DT_STRTAB:
-                    strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
+                    ret.dyn_tabs.strtab = reinterpret_cast<const char*>(d->d_un.d_ptr);
                     break;
                 case DT_JMPREL:
                     jmp = reinterpret_cast<const Elf64_Rela*>(d->d_un.d_ptr);
@@ -1128,10 +1174,8 @@ init_table get_init(Elf64_Ehdr* header)
                     break;
                 }
             }
-            auto nbucket = hashtab[0];
-            auto buckets = hashtab + 2;
-            auto chain = buckets + nbucket;
-            auto relocate_table = [=](const Elf64_Rela *rtab, unsigned n) {
+            auto relocate_table = [=](struct init_table *t,
+                                      const Elf64_Rela *rtab, unsigned n) {
                 if (!rtab) {
                     return;
                 }
@@ -1141,67 +1185,16 @@ init_table get_init(Elf64_Ehdr* header)
                     u32 type = info & 0xffffffff;
                     void *addr = base + r->r_offset;
                     auto addend = r->r_addend;
-                    auto lookup = [=]() -> const Elf64_Sym* {
-                        auto name = strtab + symtab[sym].st_name;
-                        for (auto ent = buckets[elf64_hash(name) % nbucket];
-                                ent != STN_UNDEF;
-                                ent = chain[ent]) {
-                            auto &sym = symtab[ent];
-                            if (strcmp(name, &strtab[sym.st_name]) == 0) {
-                                return &sym;
-                            }
-                        }
-                        abort();
-                    };
-                    switch (type) {
-#ifdef __x86_64__
-                    case R_X86_64_NONE:
-                        break;
-                    case R_X86_64_64:
-                        *static_cast<u64*>(addr) = lookup()->st_value + addend;
-                        break;
-                    case R_X86_64_RELATIVE:
-                        *static_cast<void**>(addr) = base + addend;
-                        break;
-                    case R_X86_64_JUMP_SLOT:
-                    case R_X86_64_GLOB_DAT:
-                        *static_cast<u64*>(addr) = lookup()->st_value;
-                        break;
-                    case R_X86_64_DPTMOD64:
-                        abort();
-                        //*static_cast<u64*>(addr) = symbol_module(sym);
-                        break;
-                    case R_X86_64_DTPOFF64:
-                        *static_cast<u64*>(addr) = lookup()->st_value;
-                        break;
-                    case R_X86_64_TPOFF64:
-                        // FIXME: assumes TLS segment comes before DYNAMIC segment
-                        *static_cast<u64*>(addr) = lookup()->st_value - ret.tls.size;
-                        break;
-                    case R_X86_64_IRELATIVE:
-                        *static_cast<void**>(addr) = reinterpret_cast<void *(*)()>(base + addend)();
-                        break;
-#endif /* __x86_64__ */
-#ifdef __aarch64__
-                    case R_AARCH64_NONE:
-                    case R_AARCH64_NONE2:
-                        break;
-                    case R_AARCH64_GLOB_DAT:
-                        *static_cast<u64*>(addr) = lookup()->st_value + addend;
-                        break;
-                    case R_AARCH64_TLS_TPREL64:
-                        *static_cast<u64*>(addr) = lookup()->st_value + addend;
-                        break;
-#endif /* __aarch64__ */
-                    default:
-                        debug_early_u64("Unsupported relocation type=", (u64)type);
+
+                    if (!arch_init_reloc_dyn(t, type, sym,
+                                             addr, base, addend)) {
+                        debug_early_u64("Unsupported relocation type=", type);
                         abort();
                     }
-
                 }
             };
-            relocate_table(rela, nrela);
-            relocate_table(jmp, njmp);
+            relocate_table(&ret, rela, nrela);
+            relocate_table(&ret, jmp, njmp);
         } else if (phdr->p_type == PT_TLS) {
             ret.tls.start = reinterpret_cast<void*>(phdr->p_vaddr);
             ret.tls.filesize = phdr->p_filesz;
@@ -1302,7 +1295,11 @@ extern "C" { void* elf_resolve_pltgot(unsigned long index, elf::object* obj); }
 
 void* elf_resolve_pltgot(unsigned long index, elf::object* obj)
 {
-    return obj->resolve_pltgot(index);
+    // symbol resolution of a variable can happen with a dirty fpu
+    sched::fpu_lock fpu;
+    WITH_LOCK(fpu) {
+        return obj->resolve_pltgot(index);
+    }
 }
 
 struct module_and_offset {

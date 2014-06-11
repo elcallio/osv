@@ -12,8 +12,11 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <osv/types.h>
 #include <atomic>
+
+#include "arch-elf.hh"
 
 /// Marks a shared object as locked in memory so OSv APIs like preempt_disable() can be used
 #define OSV_ELF_MLOCK_OBJECT() asm(".pushsection .note.osv-mlock, \"a\"; .popsection")
@@ -32,14 +35,14 @@ typedef u64 Elf64_Xword;
 typedef signed long Elf64_Sxword;
 
 enum {
-    EI_MAG0 = 0, // File identiﬁcation
+    EI_MAG0 = 0, // File identification
     EI_MAG1 = 1,
     EI_MAG2 = 2,
     EI_MAG3 = 3,
     EI_CLASS = 4, // File class
     EI_DATA = 5, // Data encoding
     EI_VERSION = 6, // File version
-    EI_OSABI = 7, // OS/ABI identiﬁcation
+    EI_OSABI = 7, // OS/ABI identification
     EI_ABIVERSION = 8, // ABI version
     EI_PAD = 9, // Start of padding bytes
     EI_NIDENT = 16, // Size of e_ident[]
@@ -51,8 +54,8 @@ enum {
 };
 
 enum {
-    ELFDATA2LSB = 1, // Object ﬁle data structures are little-endian
-    ELFDATA2MSB = 2, // Object ﬁle data structures are big-endian
+    ELFDATA2LSB = 1, // Object file data structures are little-endian
+    ELFDATA2MSB = 2, // Object file data structures are big-endian
 };
 
 enum {
@@ -122,7 +125,7 @@ enum {
     DT_PLTRELSZ = 2, // d_val Total size, in bytes, of the relocation entries associated with
       // the procedure linkage table.
     DT_PLTGOT = 3, // d_ptr Contains an address associated with the linkage table. The
-      // speciﬁc meaning of this ﬁeld is processor-dependent.
+      // specific meaning of this field is processor-dependent.
     DT_HASH = 4, // d_ptr Address of the symbol hash table, described below.
     DT_STRTAB = 5, // d_ptr Address of the dynamic string table.
     DT_SYMTAB = 6, // d_ptr Address of the dynamic symbol table.
@@ -135,9 +138,9 @@ enum {
     DT_FINI = 13, // d_ptr Address of the termination function.
     DT_SONAME = 14, // d_val The string table offset of the name of this shared object.
     DT_RPATH = 15, // d_val The string table offset of a shared library search path string.
-    DT_SYMBOLIC = 16, // ignored The presence of this dynamic table entry modiﬁes the
+    DT_SYMBOLIC = 16, // ignored The presence of this dynamic table entry modifies the
       // symbol resolution algorithm for references within the
-      // library. Symbols deﬁned within the library are used to
+      // library. Symbols defined within the library are used to
       // resolve references before the dynamic linker searches the
       // usual search path.
     DT_REL = 17, // d_ptr Address of a relocation table with Elf64_Rel entries.
@@ -158,11 +161,11 @@ enum {
     DT_FINI_ARRAY = 26, // d_ptr Pointer to an array of pointers to termination functions.
     DT_INIT_ARRAYSZ = 27, // d_val Size, in bytes, of the array of initialization functions.
     DT_FINI_ARRAYSZ = 28, // d_val Size, in bytes, of the array of termination functions.
-    DT_LOOS = 0x60000000, // Deﬁnes a range of dynamic table tags that are reserved for
-      // environment-speciﬁc use.
+    DT_LOOS = 0x60000000, // Defines a range of dynamic table tags that are reserved for
+      // environment-specific use.
     DT_HIOS = 0x6FFFFFFF, //
-    DT_LOPROC = 0x70000000, // Deﬁnes a range of dynamic table tags that are reserved for
-      // processor-speciﬁc use.
+    DT_LOPROC = 0x70000000, // Defines a range of dynamic table tags that are reserved for
+      // processor-specific use.
     DT_HIPROC = 0x7FFFFFFF, //
     DT_GNU_HASH = 0x6ffffef5,
 };
@@ -186,80 +189,33 @@ struct Elf64_Rela {
 };
 
 enum {
-    R_X86_64_NONE = 0, //  none none
-    R_X86_64_64 = 1, //  word64 S + A
-    R_X86_64_PC32 = 2, //  word32 S + A - P
-    R_X86_64_GOT32 = 3, //  word32 G + A
-    R_X86_64_PLT32 = 4, //  word32 L + A - P
-    R_X86_64_COPY = 5, //  none none
-    R_X86_64_GLOB_DAT = 6, //  word64 S
-    R_X86_64_JUMP_SLOT = 7, //  word64 S
-    R_X86_64_RELATIVE = 8, //  word64 B + A
-    R_X86_64_GOTPCREL = 9, //  word32 G + GOT + A - P
-    R_X86_64_32 = 10, //  word32 S + A
-    R_X86_64_32S = 11, //  word32 S + A
-    R_X86_64_16 = 12, //  word16 S + A
-    R_X86_64_PC16 = 13, //  word16 S + A - P
-    R_X86_64_8 = 14, //  word8 S + A
-    R_X86_64_PC8 = 15, //  word8 S + A - P
-    R_X86_64_DPTMOD64 = 16, //  word64
-    R_X86_64_DTPOFF64 = 17, //  word64
-    R_X86_64_TPOFF64 = 18, //  word64
-    R_X86_64_TLSGD = 19, //  word32
-    R_X86_64_TLSLD = 20, //  word32
-    R_X86_64_DTPOFF32 = 21, //  word32
-    R_X86_64_GOTTPOFF = 22, //  word32
-    R_X86_64_TPOFF32 = 23, //  word32
-    R_X86_64_PC64 = 24, //  word64 S + A - P
-    R_X86_64_GOTOFF64 = 25, //  word64 S + A - GOT
-    R_X86_64_GOTPC32 = 26, //  word32 GOT + A - P
-    R_X86_64_SIZE32 = 32, //  word32 Z + A
-    R_X86_64_SIZE64 = 33, //  word64 Z + A
-    R_X86_64_IRELATIVE = 37, //  word64 indirect(B + A)
-    };
-
-enum {
-    R_AARCH64_NONE = 0,
-    R_AARCH64_NONE2 = 256,
-    R_AARCH64_COPY = 1024,
-    R_AARCH64_GLOB_DAT = 1025,
-    R_AARCH64_JUMP_SLOT = 1026,
-    R_AARCH64_RELATIVE = 1027,
-    R_AARCH64_TLS_DTPREL64 = 1028,
-    R_AARCH64_TLS_DTPMOD64 = 1029,
-    R_AARCH64_TLS_TPREL64 = 1030,
-    R_AARCH64_TLSDESC = 1031,
-    R_AARCH64_IRELATIVE = 1032
-    };
-
-enum {
-    STB_LOCAL = 0, //  Not visible outside the object ﬁle
-    STB_GLOBAL = 1, // Global symbol, visible to all object ﬁles
+    STB_LOCAL = 0, //  Not visible outside the object file
+    STB_GLOBAL = 1, // Global symbol, visible to all object files
     STB_WEAK = 2, // Global scope, but with lower precedence than global symbols
-    STB_LOOS = 10, // Environment-speciﬁc use
+    STB_LOOS = 10, // Environment-specific use
     STB_HIOS = 12,
-    STB_LOPROC = 13, // Processor-speciﬁc use
+    STB_LOPROC = 13, // Processor-specific use
     STB_HIPROC = 15,
 };
 
 enum {
-    STT_NOTYPE = 0, // No type speciﬁed (e.g., an absolute symbol)
+    STT_NOTYPE = 0, // No type specified (e.g., an absolute symbol)
     STT_OBJECT = 1, // Data object
     STT_FUNC = 2, // Function entry point
     STT_SECTION = 3, // Symbol is associated with a section
-    STT_FILE = 4, // Source ﬁle associated with the object ﬁle
-    STT_LOOS = 10, // Environment-speciﬁc use
+    STT_FILE = 4, // Source file associated with the object file
+    STT_LOOS = 10, // Environment-specific use
     STT_HIOS = 12,
-    STT_LOPROC = 13, // Processor-speciﬁc use
+    STT_LOPROC = 13, // Processor-specific use
     STT_HIPROC = 15,
     STT_IFUNC = 10, // Indirect function
 };
 
 enum {
-    SHN_UNDEF = 0, // Used to mark an undeﬁned or meaningless section reference
-    SHN_LOPROC = 0xFF00, // Processor-speciﬁc use
+    SHN_UNDEF = 0, // Used to mark an undefined or meaningless section reference
+    SHN_LOPROC = 0xFF00, // Processor-specific use
     SHN_HIPROC = 0xFF1F,
-    SHN_LOOS = 0xFF20, // Environment-speciﬁc use
+    SHN_LOOS = 0xFF20, // Environment-specific use
     SHN_HIOS = 0xFF3F,
     SHN_ABS = 0xFFF1, // Indicates that the corresponding reference is an absolute value
     SHN_COMMON = 0xFFF2, // Indicates a symbol that has been declared as a common block
@@ -305,11 +261,11 @@ struct [[gnu::packed]] Elf64_Shdr {
     Elf64_Xword sh_entsize; /* Size of entries, if section has table */
 };
 
-class object {
+class object: public std::enable_shared_from_this<elf::object> {
 public:
     explicit object(program& prog, std::string pathname);
     virtual ~object();
-    void load_needed();
+    void load_needed(std::vector<std::shared_ptr<object>>& loaded_objects);
     void unload_needed();
     void relocate();
     void set_base(void* base);
@@ -371,13 +327,21 @@ protected:
     // unloaded. When this object is unloaded, the reference count of all
     // objects listed here goes down, and they too may be unloaded.
     std::vector<std::shared_ptr<elf::object>> _needed;
-    // TODO: we also need a set<shared_ptr<object>> for other objects used in
-    // resolving symbols from this symbol.
-
+    std::unordered_set<std::shared_ptr<elf::object>> _used_by_resolve_plt_got;
+    mutex _used_by_resolve_plt_got_mutex;
     // Allow objects on program->_modules to be usable for the threads
     // currently initializing them, but not yet visible for other threads.
     // This simplifies the code (the initializer can use the regular lookup
     // functions).
+
+protected:
+    // arch-specific relocations
+    // ADDR is written to, based on the input params and the object state.
+    // The return value is true on success, false on failure.
+    bool arch_relocate_rela(u32 type, u32 sym, void *addr,
+                            Elf64_Sxword addend);
+    bool arch_relocate_jump_slot(u32 sym, void *addr, Elf64_Sxword addend);
+
 private:
     std::atomic<void*> _visibility;
     bool visible(void) const;
@@ -514,6 +478,9 @@ private:
     void remove_object(object *obj);
     ulong register_dtv(object* obj);
     void free_dtv(object* obj);
+    std::shared_ptr<object> load_object(std::string name,
+            std::vector<std::string> extra_path,
+            std::vector<std::shared_ptr<object>> &loaded_objects);
 private:
     mutex _mutex;
     void* _next_alloc;
@@ -547,11 +514,25 @@ private:
  */
 program* get_program();
 
+/* tables needed for initial dynamic segment relocations */
+struct init_dyn_tabs {
+    const Elf64_Sym *symtab;
+    const Elf64_Word *hashtab;
+    const char *strtab;
+    const Elf64_Sym *lookup(u32 sym);
+};
+
 struct init_table {
     void (**start)();
     unsigned count;
     tls_data tls;
+
+    struct init_dyn_tabs dyn_tabs;
 };
+
+/* arch-specific relocation for initial dynamic segment relocations */
+bool arch_init_reloc_dyn(struct init_table *t, u32 type, u32 sym,
+                         void *addr, void *base, Elf64_Sxword addend);
 
 init_table get_init(Elf64_Ehdr* header);
 

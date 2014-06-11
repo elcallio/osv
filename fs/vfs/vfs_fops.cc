@@ -35,7 +35,7 @@ int vfs_file::close()
 	if (error)
 		return error;
 
-	drele(fp->f_dentry);
+	fp->f_dentry.reset();
 	return 0;
 }
 
@@ -140,14 +140,19 @@ int vfs_file::chmod(mode_t mode)
 	abort();
 }
 
-bool vfs_file::map_page(uintptr_t off, size_t size, mmu::hw_ptep ptep, mmu::pt_element pte, bool write, bool shared)
+bool vfs_file::map_page(uintptr_t off, mmu::hw_ptep<0> ptep, mmu::pt_element pte, bool write, bool shared)
 {
     return pagecache::get(this, off, ptep, pte, write, shared);
 }
 
-bool vfs_file::put_page(void *addr, uintptr_t off, size_t size, mmu::hw_ptep ptep)
+bool vfs_file::put_page(void *addr, uintptr_t off, mmu::hw_ptep<0> ptep)
 {
     return pagecache::release(this, addr, off, ptep);
+}
+
+void vfs_file::sync(off_t start, off_t end)
+{
+    pagecache::sync(this, start, end);
 }
 
 // Locking: vn_lock will call into the filesystem, and that can trigger an

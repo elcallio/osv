@@ -19,6 +19,8 @@
 #include <osv/rcu.hh>
 #include <osv/mutex.h>
 
+#include "fault-fixup.hh"
+
 typedef boost::format fmt;
 
 __thread exception_frame* current_interrupt_frame;
@@ -207,6 +209,8 @@ extern "C" { void interrupt(exception_frame* frame); }
 
 void interrupt(exception_frame* frame)
 {
+    sched::fpu_lock fpu;
+    SCOPE_LOCK(fpu);
     // Rather that force the exception frame down the call stack,
     // remember it in a global here.  This works because our interrupts
     // don't nest.
@@ -217,23 +221,6 @@ void interrupt(exception_frame* frame)
     current_interrupt_frame = nullptr;
     // FIXME: layering violation
     sched::preempt();
-}
-
-struct fault_fixup {
-    ulong pc;
-    ulong divert;
-    friend bool operator<(fault_fixup a, fault_fixup b) {
-        return a.pc < b.pc;
-    }
-};
-
-extern fault_fixup fault_fixup_start[], fault_fixup_end[];
-
-static void sort_fault_fixup() __attribute__((constructor(init_prio::sort)));
-
-static void sort_fault_fixup()
-{
-    std::sort(fault_fixup_start, fault_fixup_end);
 }
 
 bool fixup_fault(exception_frame* ef)
@@ -270,6 +257,8 @@ extern "C" void nmi(exception_frame* ef)
 extern "C"
 void general_protection(exception_frame* ef)
 {
+    sched::fpu_lock fpu;
+    SCOPE_LOCK(fpu);
     if (fixup_fault(ef)) {
         return;
     }

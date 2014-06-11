@@ -224,17 +224,8 @@ void vmxnet3_rxqueue::init()
         rxr.clear_descs();
 
         for (unsigned idx = 0; idx < rxr.get_desc_num(); idx++) {
-            auto error = newbuf(i);
-            if (error)
-                throw std::runtime_error("buf allocation failed");
+            newbuf(i);
         }
-    }
-
-    for (unsigned i = 1; i < VMXNET3_RXRINGS_PERQ; i++) {
-        auto &rxr = cmd_rings[i];
-        rxr.fill = 0;
-        rxr.gen = 0;
-        rxr.clear_descs();
     }
 
     auto &rxc = comp_ring;
@@ -251,29 +242,7 @@ void vmxnet3_rxqueue::discard(int rid, int idx)
     rxr.increment_fill();
 }
 
-void vmxnet3_rxqueue::discard_chain(int rid)
-{
-    while (1) {
-        auto &rxc = comp_ring;
-        auto rxcd = rxc.get_desc(rxc.next);
-        if (rxcd->layout->gen != rxc.gen)
-            break;
-        rmb();
-
-        if (++rxc.next == rxc.get_desc_num()) {
-            rxc.next = 0;
-            rxc.gen ^= 1;
-        }
-
-        auto idx = rxcd->layout->rxd_idx;
-        auto eof = rxcd->layout->eop;
-        discard(rid, idx);
-        if (eof)
-            break;
-    }
-}
-
-int vmxnet3_rxqueue::newbuf(int rid)
+void vmxnet3_rxqueue::newbuf(int rid)
 {
     auto &rxr = cmd_rings[rid];
     auto idx = rxr.fill;
@@ -292,7 +261,7 @@ int vmxnet3_rxqueue::newbuf(int rid)
     auto m = m_getjcl(M_NOWAIT, MT_DATA, flags, clsize);
     if (m == NULL) {
         panic("mbuf allocation failed");
-        return -1;
+        return;
     }
     if (btype == vmxnet3::VMXNET3_BTYPE_HEAD) {
         m->m_hdr.mh_len = m->M_dat.MH.MH_pkthdr.len = clsize;
@@ -303,12 +272,12 @@ int vmxnet3_rxqueue::newbuf(int rid)
     buf[rid][idx] = m;
 
     rxd->layout->addr = mmu::virt_to_phys(m->m_hdr.mh_data);
-    rxd->layout->len = m->m_hdr.mh_len;
+    rxd->layout->len = std::min(static_cast<u32>(m->m_hdr.mh_len),
+                                static_cast<u32>(VMXNET3_MAX_DESC_LEN));
     rxd->layout->btype = btype;
     rxd->layout->gen = rxr.gen;
 
     rxr.increment_fill();
-    return 0;
 }
 
 
@@ -747,7 +716,6 @@ void vmxnet3::txq_gc(vmxnet3_txqueue &txq)
 void vmxnet3::rxq_eof(vmxnet3_rxqueue &rxq)
 {
     auto &rxc = rxq.comp_ring;
-    struct mbuf *m_head = NULL, *m_tail = NULL;
 
     while(1) {
         auto rxcd = rxc.get_desc(rxc.next);
@@ -781,48 +749,35 @@ void vmxnet3::rxq_eof(vmxnet3_rxqueue &rxq)
         if (rxcd->layout->sop) {
             assert(rxd->layout->btype == VMXNET3_BTYPE_HEAD);
             assert((idx % 1) == 0);
-            assert(m_head == NULL);
+            assert(rxq.m_currpkt_head == nullptr);
 
             if (length == 0) {
                 rxq.discard(rid, idx);
                 goto next;
             }
 
-            if (rxq.newbuf(rid) != 0) {
-                rxq.discard(rid, idx);
-                if (!rxcd->layout->eop)
-                    rxq.discard_chain(rid);
-                goto next;
-            }
+            rxq.newbuf(rid);
 
             m->M_dat.MH.MH_pkthdr.len = length;
             m->M_dat.MH.MH_pkthdr.rcvif = _ifn;
             m->M_dat.MH.MH_pkthdr.csum_flags = 0;
             m->m_hdr.mh_len = length;
-            m_head = m_tail = m;
+            rxq.m_currpkt_head = rxq.m_currpkt_tail = m;
         } else {
             assert(rxd->layout->btype == VMXNET3_BTYPE_BODY);
-            assert(m_head != NULL);
+            assert(rxq.m_currpkt_head != nullptr);
 
-            if (rxq.newbuf(rid) != 0) {
-                rxq.discard(rid, idx);
-                if (!rxcd->layout->eop)
-                    rxq.discard_chain(rid);
-                m_freem(m_head);
-                _rxq_stats.rx_drops++;
-                m_head = m_tail = NULL;
-                goto next;
-            }
+            rxq.newbuf(rid);
 
             m->m_hdr.mh_len = length;
-            m_head->M_dat.MH.MH_pkthdr.len += length;
-            m_tail->m_hdr.mh_next = m;
-            m_tail = m;
+            rxq.m_currpkt_head->M_dat.MH.MH_pkthdr.len += length;
+            rxq.m_currpkt_tail->m_hdr.mh_next = m;
+            rxq.m_currpkt_tail = m;
         }
 
         if (rxcd->layout->eop) {
-            rxq_input(rxq, rxcd, m_head);
-            m_head = m_tail = NULL;
+            rxq_input(rxq, rxcd, rxq.m_currpkt_head);
+            rxq.m_currpkt_head = rxq.m_currpkt_tail = nullptr;
         }
 
 next:

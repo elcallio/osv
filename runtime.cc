@@ -6,7 +6,6 @@
  */
 
 #include <osv/sched.hh>
-#include <osv/elf.hh>
 #include <cstdlib>
 #include <cstring>
 #include <string.h>
@@ -87,29 +86,15 @@ static void print_backtrace(void)
     int len;
 
     debug_ll("\n[backtrace]\n");
-#ifdef AARCH64_PORT_STUB
-    debug_ll("NIY\n");
-    return;
-#endif
 
     len = backtrace_safe(addrs, 128);
 
     /* Skip abort(const char *) and abort(void)  */
     for (int i = 2; i < len; i++) {
-        auto addr = addrs[i] - 1;
-        auto ei = elf::get_program()->lookup_addr(addr);
-        const char *sname = ei.sym;
-        char demangled[1024];
-
-        if (!ei.sym)
-            sname = "???";
-        else if (demangle(ei.sym, demangled, sizeof(demangled)))
-            sname = demangled;
-
-        debug_ll("%p <%s+%d>\n",
-            addr, sname,
-            reinterpret_cast<uintptr_t>(addr)
-            - reinterpret_cast<uintptr_t>(ei.addr));
+        char name[1024];
+        void *addr = addrs[i] - INSTR_SIZE_MIN;
+        osv::lookup_name_demangled(addr, name, sizeof(name));
+        debug_ll("0x%016lx <%s>\n", addr, name);
     }
 }
 
@@ -205,6 +190,12 @@ int fork()
     return -1;
 }
 
+pid_t setsid(void)
+{
+    WARN_STUBBED();
+    return -1;
+}
+
 NO_SYS(int execvp(const char *, char *const []));
 NO_SYS(int symlink(const char *, const char *));
 
@@ -283,30 +274,31 @@ __locale_t __newlocale(int category_mask, const char *locale, locale_t base)
     __THROW
 {
     if (category_mask == 1 << LC_ALL) {
-	category_mask = ((1 << __LC_LAST) - 1) & ~(1 << LC_ALL);
+        category_mask = ((1 << __LC_LAST) - 1) & ~(1 << LC_ALL);
     }
     assert(locale);
     if (base == &c_locale) {
-	base = NULL;
+        base = NULL;
     }
     if ((base == NULL || all_categories(category_mask))
-	&& (category_mask == 0 || strcmp(locale, "C") == 0)) {
-	return &c_locale;
+            && (category_mask == 0 || strcmp(locale, "C") == 0)) {
+        return &c_locale;
     }
     struct __locale_struct result = base ? *base : c_locale;
     if (category_mask == 0) {
-	auto result_ptr = new __locale_struct;
-	*result_ptr = result;
-	auto ctypes = result_ptr->__locales[LC_CTYPE]->values;
-	result_ptr->__ctype_b = (const unsigned short *)
-	    ctypes[_NL_ITEM_INDEX(_NL_CTYPE_CLASS)] + 128;
-	result_ptr->__ctype_tolower = (const int *)
-	    ctypes[_NL_ITEM_INDEX(_NL_CTYPE_TOLOWER)] + 128;
-	result_ptr->__ctype_toupper = (const int *)
-	    ctypes[_NL_ITEM_INDEX(_NL_CTYPE_TOUPPER)] + 128;
-	return result_ptr;
+        auto result_ptr = new __locale_struct;
+        *result_ptr = result;
+        auto ctypes = result_ptr->__locales[LC_CTYPE]->values;
+        result_ptr->__ctype_b = (const unsigned short *)
+	            ctypes[_NL_ITEM_INDEX(_NL_CTYPE_CLASS)] + 128;
+        result_ptr->__ctype_tolower = (const int *)
+	            ctypes[_NL_ITEM_INDEX(_NL_CTYPE_TOLOWER)] + 128;
+        result_ptr->__ctype_toupper = (const int *)
+	            ctypes[_NL_ITEM_INDEX(_NL_CTYPE_TOUPPER)] + 128;
+        return result_ptr;
     }
-    abort();
+    errno = ENOENT;
+    return nullptr;
 }
 
 long sysconf(int name)
@@ -393,8 +385,21 @@ int get_nprocs()
 
 clock_t times(struct tms *buffer)
 {
-    debug("times not implemented\n");
-    return 0;
+    using namespace std::chrono;
+    struct timespec ts;
+
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+
+    typedef duration<u64, std::ratio<1, CLOCKS_PER_SEC>> clockseconds;
+    clockseconds time;
+    time = duration_cast<clockseconds>(seconds(ts.tv_sec) + nanoseconds(ts.tv_nsec));
+
+    buffer->tms_utime = time.count();
+    buffer->tms_stime = 0;
+    buffer->tms_cutime = 0;
+    buffer->tms_cstime = 0;
+
+    return buffer->tms_utime;
 }
 
 static int prio_find_thread(sched::thread **th, int which, int id)
@@ -512,5 +517,11 @@ int prctl(int option, ...)
         return 0;
     }
     errno = EINVAL;
+    return -1;
+}
+
+int daemon(int nochdir, int noclose)
+{
+    WARN_STUBBED();
     return -1;
 }

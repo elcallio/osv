@@ -9,9 +9,9 @@
 
 namespace console {
 
-void ConsoleDriver::start(std::function<void()> read_poll)
+void console_driver::start(std::function<void()> read_poll)
 {
-        _thread = new sched::thread([&] { read_poll(); },
+        _thread = new sched::thread(read_poll,
             sched::thread::attr().name(thread_name()));
         dev_start();
         _thread->start();

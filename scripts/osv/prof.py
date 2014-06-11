@@ -50,11 +50,14 @@ time_units = [
     (1, "ns")
 ]
 
-def parse_time_as_nanos(text):
+def parse_time_as_nanos(text, default_unit='ns'):
     for level, name in sorted(time_units, key=lambda (level, name): -len(name)):
         if text.endswith(name):
             return float(text.rstrip(name)) * level
-    return float(text)
+    for level, name in time_units:
+        if name == default_unit:
+            return float(text) * level
+    raise Exception('Unknown unit: ' + default_unit)
 
 def format_time(time, format="%.2f %s"):
     for level, name in sorted(time_units, key=lambda (level, name): -level):
@@ -63,14 +66,30 @@ def format_time(time, format="%.2f %s"):
     return str(time)
 
 unimportant_functions = set([
-    'trace_slow_path',
-    'operator()',
-    'std::function<void ()>::operator()() const',
-    'tracepoint_base::do_log_backtrace',
-    'tracepoint_base::log_backtrace(trace_record*, unsigned char*&)',
-    'tracepoint_base::do_log_backtrace(trace_record*, unsigned char*&)',
     '_M_invoke',
     ])
+
+unimportant_prefixes = [
+    ('tracepoint_base::log_backtrace(trace_record*, unsigned char*&)',
+     'log',
+     'trace_slow_path',
+     'operator()',
+     'prof::cpu_sampler::timer_fired()',
+     'sched::timer_base::expire()',
+     'sched::timer_list::fired()',
+     'interrupt_descriptor_table::invoke_interrupt(unsigned int)',
+     'interrupt',
+     'interrupt_entry_common'),
+
+    ('tracepoint_base::log_backtrace(trace_record*, unsigned char*&)',
+     'log',
+     'trace_slow_path',
+     'operator()'),
+
+    ('log',
+     'trace_slow_path',
+     'operator()'),
+]
 
 bottom_of_stack = set(['thread_main', 'thread_main_c'])
 
@@ -79,6 +98,12 @@ def strip_garbage(backtrace):
         if not src_addr.name:
             return True
         return not src_addr.name in unimportant_functions
+
+    for chain in unimportant_prefixes:
+        if len(backtrace) >= len(chain) and \
+                tuple(map(attrgetter('name'), backtrace[:len(chain)])) == chain:
+            backtrace = backtrace[len(chain):]
+            break
 
     backtrace = list(filter(is_good, backtrace))
 

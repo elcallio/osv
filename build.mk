@@ -11,6 +11,15 @@ else
     OBJCOPY=$(CROSS_PREFIX)objcopy
 endif
 
+build_env ?= external
+ifeq ($(build_env), host)
+    gcc_lib_env ?= host
+    cxx_lib_env ?= host
+else
+    gcc_lib_env ?= external
+    cxx_lib_env ?= external
+endif
+
 detect_arch=$(shell echo $(1) | $(CC) -E -xc - | tail -n 1)
 
 ifndef ARCH
@@ -25,13 +34,14 @@ else
 endif
 $(info build.mk:)
 $(info build.mk: building arch=$(arch), override with ARCH env)
+$(info build.mk: building build_env=$(build_env) gcc_lib_env=$(gcc_lib_env) cxx_lib_env=$(cxx_lib_env))
 $(info build.mk:)
 
 image ?= default
 img_format ?= qcow2
 fs_size_mb ?= 10240
 local-includes =
-INCLUDES = $(local-includes) -I$(src)/arch/$(arch) -I$(src) -I$(src)/include
+INCLUDES = $(local-includes) -I$(src)/arch/$(arch) -I$(src) -I$(src)/include  -I$(src)/arch/common
 INCLUDES += -isystem $(src)/include/glibc-compat
 
 glibcbase = $(src)/external/$(arch)/glibc.bin
@@ -82,6 +92,20 @@ libc/%.o: source-dialects =
 
 kernel-defines = -D_KERNEL $(source-dialects)
 
+# This play the same role as "_KERNEL", but _KERNEL unfortunately is too
+# overloaded. A lot of files will expect it to be set no matter what, specially
+# in headers. "userspace" inclusion of such headers is valid, and lacking
+# _KERNEL will make them fail to compile. That is specially true for the BSD
+# imported stuff like ZFS commands.
+#
+# To add something to the kernel build, you can write for your object:
+#
+#   mydir/*.o COMMON += <MY_STUFF>
+#
+# To add something that will *not* be part of the main kernel, you can do:
+#
+#   mydir/*.o EXTRA_FLAGS = <MY_STUFF>
+EXTRA_FLAGS = -D__OSV_CORE__
 COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -Wno-format-security \
 	-D __BSD_VISIBLE=1 -U _FORTIFY_SOURCE -fno-stack-protector $(INCLUDES) \
 	$(kernel-defines) \
@@ -89,7 +113,7 @@ COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -
 	-include $(src)/compiler/include/intrinsics.hh \
 	$(do-sys-includes) \
 	$(arch-cflags) $(conf-opt) $(acpi-defines) $(tracing-flags) \
-	$(configuration) -nostdinc -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207"
+	$(configuration) -nostdinc -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207" $(EXTRA_FLAGS)
 
 tracing-flags-0 =
 tracing-flags-1 = -finstrument-functions -finstrument-functions-exclude-file-list=c++,trace.cc,trace.hh,align.hh
@@ -186,7 +210,7 @@ q-adjust-deps = $(call very-quiet, $(adjust-deps))
 
 tests/%.o: COMMON += -fPIC -DBOOST_TEST_DYN_LINK
 
-%.so: COMMON += -fPIC -shared
+%.so: EXTRA_FLAGS = -fPIC -shared
 %.so: %.o
 	$(makedir)
 	$(q-build-so)
@@ -196,6 +220,9 @@ autodepend = -MD -MT $@ -MP
 
 do-sys-includes = $(foreach inc, $(sys-includes), -isystem $(inc))
 
+ifeq ($(arch),aarch64)
+boost-tests :=
+else
 boost-tests := tests/tst-rename.so
 boost-tests += tests/tst-vfs.so
 boost-tests += tests/tst-libc-locking.so
@@ -211,9 +238,21 @@ boost-tests += tests/tst-bsd-tcp1.so
 boost-tests += tests/tst-async.so
 boost-tests += tests/tst-rcu-list.so
 boost-tests += tests/tst-tcp-listen.so
+boost-tests += tests/tst-poll.so
+boost-tests += tests/tst-bitset-iter.so
+boost-tests += tests/tst-timer-set.so
+boost-tests += tests/tst-clock.so
+endif
 
+ifeq ($(arch),aarch64)
+java_tests :=
+else
 java_tests := tests/hello/Hello.class
+endif
 
+ifeq ($(arch),aarch64)
+tests :=
+else
 tests := tests/tst-pthread.so tests/tst-ramdisk.so
 tests += tests/tst-vblk.so tests/bench/bench.jar tests/reclaim/reclaim.jar
 tests += tests/tst-bsd-evh.so tests/misc-bsd-callout.so
@@ -223,7 +262,9 @@ tests += tests/tst-fpu.so
 tests += tests/tst-preempt.so
 tests += tests/tst-tracepoint.so
 tests += tests/tst-hub.so
+tests += tests/misc-console.so
 tests += tests/misc-leak.so
+tests += tests/misc-readbench.so
 tests += tests/misc-mmap-anon-perf.so
 tests += tests/tst-mmap-file.so
 tests += tests/misc-mmap-big-file.so
@@ -246,7 +287,7 @@ tests += tests/tst-remove.so
 tests += tests/misc-wake.so
 tests += tests/tst-epoll.so
 tests += tests/misc-lfring.so
-tests += tests/tst-fsx.so
+tests += tests/misc-fsx.so
 tests += tests/tst-sleep.so
 tests += tests/tst-resolve.so
 tests += tests/tst-except.so
@@ -262,6 +303,7 @@ tests += tests/tst-truncate.so
 tests += $(boost-tests)
 tests += tests/misc-panic.so
 tests += tests/tst-utimes.so
+tests += tests/tst-futimesat.so
 tests += tests/misc-tcp.so
 tests += tests/tst-strerror_r.so
 tests += tests/misc-random.so
@@ -269,6 +311,7 @@ tests += tests/misc-urandom.so
 tests += tests/tst-commands.so
 tests += tests/tst-threadcomplete.so
 tests += tests/tst-timerfd.so
+tests += tests/tst-nway-merger.so
 tests += tests/tst-memmove.so
 tests += tests/tst-pthread-clock.so
 tests += tests/misc-procfs.so
@@ -278,12 +321,33 @@ tests += tests/tst-concurrent-init.so
 tests += tests/tst-ring-spsc-wraparound.so
 tests += tests/tst-shm.so
 tests += tests/tst-align.so
+tests += tests/tst-cxxlocale.so
 tests += tests/misc-tcp-close-without-reading.so
 tests += tests/tst-sigwait.so
+tests += tests/tst-sampler.so
+tests += tests/misc-malloc.so
+tests += tests/misc-memcpy.so
+tests += tests/misc-free-perf.so
+tests += tests/tst-fallocate.so
+tests += tests/misc-printf.so
+tests += tests/libstatic-thread-variable.so tests/tst-static-thread-variable.so
+tests/tst-static-thread-variable.so: tests/libstatic-thread-variable.so
+tests/tst-static-thread-variable.so: COMMON += -L./tests -lstatic-thread-variable
+endif
+
+ifeq ($(arch),aarch64)
+lib_tests :=
+else
+lib_tests := tests/libstatic-thread-variable.so
+endif
 
 tests/hello/Hello.class: javabase=tests/hello
 
-java-targets = java-jars java/java.so
+ifeq ($(arch),aarch64)
+java-targets :=
+else
+java-targets := java-jars java/java.so
+endif
 
 java-jars:
 	$(call quiet, cd $(src)/java && mvn package -q -DskipTests=true, MVN $@)
@@ -294,6 +358,11 @@ tools := tools/ifconfig/ifconfig.so
 tools += tools/route/lsroute.so
 tools += tools/mkfs/mkfs.so
 tools += tools/cpiod/cpiod.so
+
+ifeq ($(arch),aarch64)
+tools += tests/tst-hello.so
+cmdline = tests/tst-hello.so
+endif
 
 ifeq ($(arch),x64)
 
@@ -424,6 +493,7 @@ bsd += bsd/porting/kthread.o
 bsd += bsd/porting/mmu.o
 bsd += bsd/porting/pcpu.o
 bsd += bsd/porting/bus_dma.o
+bsd += bsd/porting/kobj.o
 bsd += bsd/sys/netinet/if_ether.o  
 bsd += bsd/sys/compat/linux/linux_socket.o  
 bsd += bsd/sys/compat/linux/linux_ioctl.o  
@@ -487,14 +557,12 @@ bsd += bsd/sys/dev/xen/netfront/netfront.o
 bsd += bsd/sys/dev/xen/blkfront/blkfront.o
 endif
 
-ifeq ($(arch),x64)
 bsd += bsd/sys/dev/random/hash.o
 bsd += bsd/sys/dev/random/randomdev_soft.o
 bsd += bsd/sys/dev/random/yarrow.o
 bsd += bsd/sys/dev/random/random_harvestq.o
 bsd += bsd/sys/dev/random/harvest.o
 bsd += bsd/sys/dev/random/live_entropy_sources.o
-endif
 
 bsd/sys/%.o: COMMON += -Wno-sign-compare -Wno-narrowing -Wno-write-strings -Wno-parentheses -Wno-unused-but-set-variable
 
@@ -624,6 +692,7 @@ zfs += bsd/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/zio_inject.o
 zfs += bsd/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/zle.o
 zfs += bsd/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/zrlock.o
 zfs += bsd/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/zvol.o
+zfs += bsd/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/lz4.o
 
 zfs-tests += tests/misc-zfs-disk.so
 zfs-tests += tests/misc-zfs-io.so
@@ -673,6 +742,10 @@ drivers += drivers/clockevent.o
 drivers += drivers/ramdisk.o
 drivers += core/elf.o
 drivers += java/jvm_balloon.o
+drivers += java/java_api.o
+drivers += drivers/random.o
+drivers += drivers/zfs.o
+drivers += drivers/null.o
 
 ifeq ($(arch),x64)
 drivers += $(libtsm)
@@ -695,14 +768,11 @@ drivers += drivers/acpi.o
 drivers += drivers/hpet.o
 drivers += drivers/xenfront.o drivers/xenfront-xenbus.o drivers/xenfront-blk.o
 drivers += drivers/pvpanic.o
-drivers += drivers/random.o
 drivers += drivers/ahci.o
 drivers += drivers/ide.o
 drivers += drivers/pci.o
 drivers += drivers/scsi-common.o
 drivers += drivers/vmw-pvscsi.o
-drivers += drivers/zfs.o
-drivers += java/java_api.o
 endif # x64
 
 ifeq ($(arch),aarch64)
@@ -721,6 +791,8 @@ objects += arch/$(arch)/elf-dl.o
 objects += arch/$(arch)/entry.o
 objects += arch/$(arch)/mmu.o
 objects += arch/$(arch)/exceptions.o
+objects += arch/$(arch)/dump.o
+objects += arch/$(arch)/arch-elf.o
 
 ifeq ($(arch),aarch64)
 objects += arch/$(arch)/arm-clock.o
@@ -729,18 +801,18 @@ endif
 
 ifeq ($(arch),x64)
 objects += arch/x64/arch-trace.o
-objects += arch/x64/dump.o
 objects += arch/x64/ioapic.o
-objects += arch/x64/math.o
 objects += arch/x64/apic.o
 objects += arch/x64/apic-clock.o
 objects += arch/x64/cpuid.o
 objects += arch/x64/entry-xen.o
 objects += arch/x64/xen.o
 objects += arch/x64/xen_intr.o
+objects += core/sampler.o
 objects += $(acpi)
 endif # x64
 
+objects += core/math.o
 objects += core/spinlock.o
 objects += core/lfmutex.o
 objects += core/rwlock.o
@@ -784,10 +856,35 @@ include $(src)/libc/build.mk
 objects += $(addprefix fs/, $(fs))
 objects += $(addprefix libc/, $(libc))
 
-libstdc++.a = $(shell find $(gccbase)/ -name libstdc++.a)
-libsupc++.a = $(shell find $(gccbase)/ -name libsupc++.a)
-libgcc_s.a = $(shell find $(gccbase)/ -name libgcc.a |  grep -v /32/)
-libgcc_eh.a = $(shell find $(gccbase)/ -name libgcc_eh.a |  grep -v /32/)
+ifeq ($(cxx_lib_env), host)
+    libstdc++.a := $(shell $(CXX) -print-file-name=libstdc++.a)
+    ifeq ($(filter /%,$(libstdc++.a)),)
+        $(error Error: libstdc++.a needs to be installed.)
+    endif
+
+    libsupc++.a := $(shell $(CXX) -print-file-name=libsupc++.a)
+    ifeq ($(filter /%,$(libsupc++.a)),)
+        $(error Error: libsupc++.a needs to be installed.)
+    endif
+else
+    libstdc++.a := $(shell find $(gccbase)/ -name libstdc++.a)
+    libsupc++.a := $(shell find $(gccbase)/ -name libsupc++.a)
+endif
+
+ifeq ($(gcc_lib_env), host)
+    libgcc.a := $(shell $(CC) -print-libgcc-file-name)
+    ifeq ($(filter /%,$(libgcc.a)),)
+        $(error Error: libgcc.a needs to be installed.)
+    endif
+
+    libgcc_eh.a := $(shell $(CC) -print-file-name=libgcc_eh.a)
+    ifeq ($(filter /%,$(libgcc_eh.a)),)
+        $(error Error: libgcc_eh.a needs to be installed.)
+    endif
+else
+    libgcc_s.a := $(shell find $(gccbase)/ -name libgcc.a |  grep -v /32/)
+    libgcc_eh.a := $(shell find $(gccbase)/ -name libgcc_eh.a |  grep -v /32/)
+endif
 
 boost-lib-dir := $(shell dirname `find $(miscbase)/ -name libboost_system-mt.a`)
 
@@ -845,17 +942,12 @@ osv.vmdk osv.vdi:
 
 $(jni): INCLUDES += -I /usr/lib/jvm/java/include -I /usr/lib/jvm/java/include/linux/
 
-ifeq ($(arch),aarch64)
-bootfs.bin:
-	touch bootfs.bin
-else
 bootfs.bin: scripts/mkbootfs.py $(java-targets) $(out)/bootfs.manifest $(tests) $(java_tests) $(tools) \
 		tests/testrunner.so \
 		zpool.so zfs.so
 	$(call quiet, $(src)/scripts/mkbootfs.py -o $@ -d $@.d -m $(out)/bootfs.manifest \
 		-D jdkbase=$(jdkbase) -D gccbase=$(gccbase) -D \
 		glibcbase=$(glibcbase) -D miscbase=$(miscbase), MKBOOTFS $@)
-endif
 
 bootfs.o: bootfs.bin
 
@@ -889,6 +981,8 @@ $(src)/modules/tests/usr.manifest: $(src)/build.mk
 	@echo "  generating modules/tests/usr.manifest"
 	@cat $@.skel > $@
 	@echo $(tests) | tr ' ' '\n' | awk '{print "/" $$0 ": ./" $$0}' >> $@
+	@echo $(lib_tests) | tr ' ' '\n' | \
+		awk '{name=$$0; name=gensub(".*/([^/]*)", "\\1", name); print "/usr/lib/" name ": ./" $$0}' >> $@
 	@echo $(java_tests) | tr ' ' '\n' | \
 	    awk '{a=$$0; sub(".*/","",a); print "/java/" a ": ./" $$0}' >> $@
 
@@ -897,7 +991,7 @@ $(src)/modules/tests/usr.manifest: $(src)/build.mk
 .PHONY: process-modules
 process-modules: bootfs.manifest.skel usr.manifest.skel $(src)/modules/tests/usr.manifest $(java-targets)
 	cd $(out)/module \
-	  && jdkbase=$(jdkbase) OSV_BASE=$(src) OSV_BUILD_PATH=$(out) $(src)/scripts/module.py --image-config $(image)
+	  && jdkbase=$(jdkbase) OSV_BASE=$(src) OSV_BUILD_PATH=$(out) MAKEFLAGS= $(src)/scripts/module.py --image-config $(image)
 
 $(out)/cmdline: process-modules
 $(out)/bootfs.manifest: process-modules

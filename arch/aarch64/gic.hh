@@ -99,9 +99,8 @@ enum class gicc_reg : unsigned int {
     GICC_APR    = 0x00d0, /* Active Priorities Registers */
     GICC_NSAPR  = 0x00e0, /* Non-secure APR */
     GICC_IIDR   = 0x00fc, /* CPU Interface Identification Reg */
-    /* GICC_DIR: we will not use the two-step mechanism,
-     * reg is also outside of the range in the machvirt map.
-     * GICC_DIR    = 0x1000 Deactivate Interrupt Reg */
+    GICC_DIR    = 0x1000  /* Deactivate Interrupt Reg */
+    /* Note: we will not use GICC_DIR (the two-step mechanism) */
 };
 
 /* GIC CPU Interface */
@@ -165,7 +164,9 @@ protected:
     /* cpu_targets: our smp cpu index is not necessarily equal
        to the gic interface target. We query the gic to get
        the cpumask corresponding to each smp cpu (gic_init_on_cpu),
-       and put the result here at the right smp index. */
+       and put the result here at the right smp index.
+       Note that for uniprocessor we will have just a zero
+       stored in cpu_targets[0] instead. */
     unsigned char cpu_targets[max_cpu_if];
     mutex gic_lock;
 };

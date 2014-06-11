@@ -1,5 +1,51 @@
+/*
+ * Copyright (C) 2014 Huawei Technologies Duesseldorf GmbH
+ *
+ * This work is open source software, licensed under the terms of the
+ * BSD license as described in the LICENSE file in the top-level directory.
+ */
+
 #include <osv/mmu.hh>
 #include <osv/prio.hh>
+#include <osv/sched.hh>
+#include <osv/debug.h>
+#include <osv/irqlock.hh>
+
+#include "arch-cpu.hh"
+#include "exceptions.hh"
+
+void page_fault(exception_frame *ef)
+{
+    sched::fpu_lock fpu;
+    SCOPE_LOCK(fpu);
+    debug_early_entry("page_fault");
+    u64 addr;
+    asm volatile ("mrs %0, far_el1" : "=r"(addr));
+    debug_early_u64("faulting address ", (u64)addr);
+
+    if (fixup_fault(ef)) {
+        debug_early("fixed up with fixup_fault\n");
+        return;
+    }
+
+    if (!ef->elr) {
+        debug_early("trying to execute null pointer\n");
+        abort();
+    }
+
+    /* vm_fault might sleep, so check that the thread is preemptable,
+     * and that interrupts in the saved pstate are enabled.
+     * Then enable interrupts for the vm_fault.
+     */
+    assert(sched::preemptable());
+    assert(!(ef->spsr & processor::daif_i));
+
+    DROP_LOCK(irq_lock) {
+        mmu::vm_fault(addr, ef);
+    }
+
+    debug_early("leaving page_fault()\n");
+}
 
 namespace mmu {
 
@@ -29,8 +75,7 @@ pt_element *get_root_pt(uintptr_t virt)
 
 pt_element make_empty_pte() { return pt_element(); }
 
-pt_element make_pte(phys addr, bool large,
-                    unsigned perm = perm_read | perm_write | perm_exec)
+pt_element make_pte(phys addr, bool large, unsigned perm)
 {
     pt_element pte;
     pte.set_valid(perm != 0);
@@ -42,10 +87,16 @@ pt_element make_pte(phys addr, bool large,
 
     arch_pt_element::set_user(&pte, false);
     arch_pt_element::set_accessed(&pte, true);
-    /* at the moment we hardcode memory attributes,
-       but the API would need to be adapted for device direct assignment */
     arch_pt_element::set_share(&pte, true);
-    arch_pt_element::set_attridx(&pte, 4);
+
+    if (addr >= mmu::device_range_start && addr < mmu::device_range_stop) {
+        /* we need to mark device memory as such, because the
+           semantics of the load/store instructions change */
+        debug_early_u64("make_pte: device memory at ", (u64)addr);
+        arch_pt_element::set_attridx(&pte, 0);
+    } else {
+        arch_pt_element::set_attridx(&pte, 4);
+    }
 
     return pte;
 }
@@ -74,4 +125,7 @@ bool is_page_fault_write_exclusive(unsigned int esr) {
     return is_page_fault_write(esr);
 }
 
+bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef) {
+    return false;
+}
 }

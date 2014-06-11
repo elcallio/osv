@@ -14,11 +14,11 @@
 
 namespace console {
 
-class ConsoleMultiplexer {
+class console_multiplexer {
 public:
-    explicit ConsoleMultiplexer(const termios *tio, ConsoleDriver *early_driver = nullptr);
-    ~ConsoleMultiplexer() {};
-    void driver_add(ConsoleDriver *driver);
+    explicit console_multiplexer(const termios *tio, console_driver *early_driver = nullptr);
+    ~console_multiplexer() {};
+    void driver_add(console_driver *driver);
     void start();
     void read(struct uio *uio, int ioflag);
     void write_ll(const char *str, size_t len);
@@ -31,8 +31,8 @@ private:
     const termios *_tio;
     spinlock _early_lock;
     bool _started = false;
-    ConsoleDriver *_early_driver;
-    std::list<ConsoleDriver *> _drivers;
+    console_driver *_early_driver;
+    std::list<console_driver *> _drivers;
     mutex _mutex;
     LineDiscipline *_ldisc;
 };

@@ -42,7 +42,7 @@ termios tio = {
             /*VLNEXT*/0, /*VEOL2*/0},
 };
 
-ConsoleMultiplexer mux __attribute__((init_priority((int)init_prio::console)))
+console_multiplexer mux __attribute__((init_priority((int)init_prio::console)))
     (&tio, &arch_early_console);
 
 void write(const char *msg, size_t len)
@@ -113,25 +113,25 @@ static struct devops console_devops = {
     .devctl	= no_devctl,
 };
 
-struct driver console_driver = {
+struct driver console_drv = {
     .name	= "console",
     .devops	= &console_devops,
 };
 
-void console_driver_add(ConsoleDriver *driver)
+void console_driver_add(console_driver *driver)
 {
     mux.driver_add(driver);
 }
 
 void console_init()
 {
-    device_create(&console_driver, "console", D_CHR);
+    device_create(&console_drv, "console", D_CHR | D_TTY);
     mux.start();
 }
 
-class console_file : public special_file {
+class console_file : public tty_file {
 public:
-    console_file() : special_file(FREAD|FWRITE, DTYPE_UNSPEC) {}
+    console_file() : tty_file(FREAD|FWRITE, DTYPE_UNSPEC) {}
     virtual int read(struct uio *uio, int flags) override;
     virtual int write(struct uio *uio, int flags) override;
     virtual int ioctl(u_long com, void *data) override;

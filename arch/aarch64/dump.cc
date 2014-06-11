@@ -5,12 +5,11 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-/* XXX todo XXX */
-#include <math.h>
-#include <osv/types.h>
+#include <osv/debug.h>
+#include <osv/demangle.hh>
 
-extern "C"
-int __isnan(double v)
+#include "dump.hh"
+
+void dump_registers(exception_frame* ef)
 {
-    return false; /* XXX */
 }

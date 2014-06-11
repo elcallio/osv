@@ -12,31 +12,13 @@
 #include <boost/algorithm/string.hpp>
 #include <cctype>
 #include <osv/elf.hh>
-#include <osv/tls.hh>
+#include "arch-tls.hh"
 #include <osv/debug.hh>
 
 #include "smp.hh"
 
 #ifndef AARCH64_PORT_STUB
-#include "exceptions.hh"
-#include "drivers/pci.hh"
-#include "ioapic.hh"
 #include "drivers/acpi.hh"
-#include "drivers/driver.hh"
-#include "drivers/virtio-net.hh"
-#include "drivers/virtio-blk.hh"
-#include "drivers/virtio-scsi.hh"
-#include "drivers/virtio-rng.hh"
-#include "drivers/xenfront-xenbus.hh"
-#include "drivers/ahci.hh"
-#include "drivers/ide.hh"
-#include "drivers/vmw-pvscsi.hh"
-#include "drivers/vmxnet3.hh"
-#include "drivers/zfs.hh"
-#include "drivers/pvpanic.hh"
-#include "drivers/console.hh"
-#include "drivers/isa-serial.hh"
-#include "drivers/vga.hh"
 #endif /* !AARCH64_PORT_STUB */
 
 #include <osv/sched.hh>
@@ -55,6 +37,12 @@
 #include <osv/shutdown.hh>
 #include <osv/commands.hh>
 #include <osv/boot.hh>
+#include <osv/sampler.hh>
+
+#include "drivers/zfs.hh"
+#include "drivers/random.hh"
+#include "drivers/console.hh"
+#include "drivers/null.hh"
 
 using namespace osv;
 
@@ -81,12 +69,9 @@ void setup_tls(elf::init_table inittab)
     tls_data = inittab.tls;
     sched::init_tls(tls_data);
     memset(tls_data.start + tls_data.filesize, 0, tls_data.size - tls_data.filesize);
-    extern char tcb0[]; // defined by linker script
-    memcpy(tcb0, inittab.tls.start, inittab.tls.size);
-    auto p = reinterpret_cast<thread_control_block*>(tcb0 + inittab.tls.size);
-    p->self = p;
 
-    arch_setup_tls(p);
+    extern char tcb0[]; // defined by linker script
+    arch_setup_tls(tcb0, inittab.tls.start, inittab.tls.size);
 }
 
 extern "C" {
@@ -98,6 +83,11 @@ extern "C" {
 
 void premain()
 {
+    /* besides reporting the OSV version, this string has the function
+       to check if the early console really works early enough,
+       without depending on prior initialization. */
+    debug_early("OSv " OSV_VERSION "\n");
+
     arch_init_premain();
 
     auto inittab = elf::get_init(elf_header);
@@ -111,35 +101,23 @@ void premain()
 
 int main(int ac, char **av)
 {
-#ifdef AARCH64_PORT_STUB
-    printf("argc=%d\n", ac);
-
-    for (int i = 0; i < ac; i++) {
-        printf("argv[%d] = %s\n", i, av[i]);
-    }
-
-    printf("OSv AArch64: main reached, halting.\n");
-    while (1) {
-        asm ("wfi;");
-    }
-#endif /* AARCH64_PORT_STUB */
-
-#ifndef AARCH64_PORT_STUB
     smp_initial_find_current_cpu()->init_on_cpu();
     void main_cont(int ac, char** av);
     sched::init([=] { main_cont(ac, av); });
-#endif /* !AARCH64_PORT_STUB */
 }
 
-#ifndef AARCH64_PORT_STUB
 static bool opt_leak = false;
 static bool opt_noshutdown = false;
 static bool opt_log_backtrace = false;
 static bool opt_mount = true;
-static std::string opt_console = "both";
+static bool opt_random = true;
+static std::string opt_console = "all";
 static bool opt_verbose = false;
 static std::string opt_chdir;
 static bool opt_bootchart = false;
+
+static int sampler_frequency;
+static bool opt_enable_sampler = false;
 
 std::tuple<int, char**> parse_options(int ac, char** av)
 {
@@ -159,10 +137,12 @@ std::tuple<int, char**> parse_options(int ac, char** av)
     bpo::options_description desc("OSv options");
     desc.add_options()
         ("help", "show help text")
+        ("sampler", bpo::value<int>(), "start stack sampling profiler")
         ("trace", bpo::value<std::vector<std::string>>(), "tracepoints to enable")
         ("trace-backtrace", "log backtraces in the tracepoint log")
         ("leak", "start leak detector after boot")
         ("nomount", "don't mount the file system")
+        ("norandom", "don't initialize any random device")
         ("noshutdown", "continue running after main() returns")
         ("verbose", "be verbose, print debug messages")
         ("console", bpo::value<std::vector<std::string>>(), "select console driver")
@@ -204,6 +184,11 @@ std::tuple<int, char**> parse_options(int ac, char** av)
         enable_verbose();
     }
 
+    if (vars.count("sampler")) {
+        sampler_frequency = vars["sampler"].as<int>();
+        opt_enable_sampler = true;
+    }
+
     if (vars.count("bootchart")) {
         opt_bootchart = true;
     }
@@ -219,6 +204,7 @@ std::tuple<int, char**> parse_options(int ac, char** av)
         }
     }
     opt_mount = !vars.count("nomount");
+    opt_random = !vars.count("norandom");
 
     if (vars.count("console")) {
         auto v = vars["console"].as<std::vector<std::string>>();
@@ -254,6 +240,9 @@ std::vector<std::vector<std::string> > prepare_commands(int ac, char** av)
 {
     if (ac == 0) {
         puts("This image has an empty command line. Nothing to run.");
+#ifdef AARCH64_PORT_STUB
+        abort(); // a good test for the backtrace code
+#endif
         osv::poweroff();
     }
     std::vector<std::vector<std::string> > commands;
@@ -325,30 +314,11 @@ void* do_main_thread(void *_commands)
     auto commands =
          static_cast<std::vector<std::vector<std::string> > *>(_commands);
 
-    // initialize panic drivers
-    panic::pvpanic::probe_and_setup();
-    boot_time.event("pvpanic done");
-
-    // Enumerate PCI devices
-    pci::pci_device_enumeration();
-    boot_time.event("pci enumerated");
-
-    // Initialize all drivers
-    hw::driver_manager* drvman = hw::driver_manager::instance();
-    drvman->register_driver(virtio::blk::probe);
-    drvman->register_driver(virtio::scsi::probe);
-    drvman->register_driver(virtio::net::probe);
-    drvman->register_driver(virtio::rng::probe);
-    drvman->register_driver(xenfront::xenbus::probe);
-    drvman->register_driver(ahci::hba::probe);
-    drvman->register_driver(vmw::pvscsi::probe);
-    drvman->register_driver(vmw::vmxnet3::probe);
-    drvman->register_driver(ide::ide_drive::probe);
-    boot_time.event("drivers probe");
-    drvman->load_all();
-    drvman->list_drivers();
-
-    randomdev::randomdev_init();
+    arch_init_drivers();
+    nulldev::nulldev_init();
+    if (opt_random) {
+        randomdev::randomdev_init();
+    }
     boot_time.event("drivers loaded");
 
     if (opt_mount) {
@@ -418,27 +388,19 @@ void main_cont(int ac, char** av)
     std::tie(ac, av) = parse_options(ac, av);
     // multiple programs can be run -> separate their arguments
     cmds = prepare_commands(ac, av);
-    ioapic::init();
+
     smp_launch();
     boot_time.event("SMP launched");
     memory::enable_debug_allocator();
-    acpi::init();
-#ifdef __x86_64__
-    if (opt_console.compare("serial") == 0) {
-        console::console_driver_add(new console::IsaSerialConsole());
-    } else if (opt_console.compare("vga") == 0) {
-        console::console_driver_add(new console::VGAConsole());
-    } else if (opt_console.compare("both") == 0) {
-        console::console_driver_add(new console::IsaSerialConsole());
-        console::console_driver_add(new console::VGAConsole());
-    } else {
-        abort("Unknown console:%s", opt_console.c_str());
-    }
-#endif /* __x86_64__ */
-    console::console_init();
 
-    // Print only after console is initialized.
-    printf("OSv " OSV_VERSION "\n");
+#ifndef AARCH64_PORT_STUB
+    acpi::init();
+#endif /* !AARCH64_PORT_STUB */
+
+    if (!arch_setup_console(opt_console)) {
+        abort("Unknown console:%s\n", opt_console.c_str());
+    }
+    console::console_init();
 
     if (sched::cpus.size() > sched::max_cpus) {
         printf("Too many cpus, can't boot with greater than %u cpus.\n", sched::max_cpus);
@@ -460,8 +422,14 @@ void main_cont(int ac, char** av)
     net_init();
     boot_time.event("Network initialized");
 
-    processor::sti();
+    arch::irq_enable();
 
+#ifndef AARCH64_PORT_STUB
+    if (opt_enable_sampler) {
+        prof::config config{std::chrono::nanoseconds(1000000000 / sampler_frequency)};
+        prof::start_sampler(config);
+    }
+#endif /* !AARCH64_PORT_STUB */
 
     pthread_t pthread;
     // run the payload in a pthread, so pthread_self() etc. work
@@ -483,8 +451,6 @@ void main_cont(int ac, char** av)
         osv::shutdown();
     }
 }
-
-#endif /* !AARCH64_PORT_STUB */
 
 int __argc;
 char** __argv;

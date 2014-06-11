@@ -11,10 +11,49 @@
 #include <osv/mutex.h>
 #include <osv/condvar.h>
 #include <sys/cdefs.h>
+#include <osv/waitqueue.hh>
 
 #define RWLOCK_INITIALIZER {}
 
-typedef struct rwlock {
+#ifdef __cplusplus
+
+class rwlock;
+
+// an rwlock pretending it is an ordinary lock for
+// WITH_LOCK() and friends.  Taking the lock acquires
+// it for reading.
+//
+// example: WITH_LOCK(my_rwlock.for_read()) { ... }
+class rwlock_for_read {
+private:
+    rwlock_for_read() = default;
+public:
+    void lock();
+    void unlock();
+    friend class rwlock;
+};
+
+// an rwlock pretending it is an ordinary lock for
+// WITH_LOCK() and friends.  Taking the lock acquires
+// it for writing.
+//
+// example: WITH_LOCK(my_rwlock.for_write()) { ... }
+class rwlock_for_write {
+private:
+    rwlock_for_write() = default;
+public:
+    void lock();
+    void unlock();
+    friend class rwlock;
+};
+
+struct rwlock : private rwlock_for_read, rwlock_for_write {
+
+#else
+
+struct rwlock {
+
+#endif
 
 #ifdef __cplusplus
 
@@ -27,6 +66,7 @@ public:
     bool try_rlock();
     void runlock();
     bool try_upgrade();
+    rwlock_for_read& for_read() { return *this; }
 
     // Writer
     void wlock();
@@ -34,6 +74,7 @@ public:
     void wunlock();
     void downgrade();
     bool wowned();
+    rwlock_for_write& for_write() { return *this; }
 
 private:
 
@@ -43,20 +84,46 @@ private:
     bool read_lockable();
     bool write_lockable();
 
+    friend class rwlock_for_read;
+    friend class rwlock_for_write;
+
 #endif // __cplusplus
 
     mutex_t _mtx;
-    condvar_t _cond_readers;
-    condvar_t _cond_writers;
-
     unsigned _readers;
-    unsigned _read_waiters;
-    unsigned _write_waiters;
+    waitqueue _read_waiters;
+    waitqueue _write_waiters;
 
     void* _wowner;
     unsigned _wrecurse;
 
-} rwlock_t;
+};
+
+typedef struct rwlock rwlock_t;
+
+#ifdef __cplusplus
+
+inline void rwlock_for_read::lock()
+{
+    static_cast<rwlock*>(this)->rlock();
+}
+
+inline void rwlock_for_read::unlock()
+{
+    static_cast<rwlock*>(this)->runlock();
+}
+
+inline void rwlock_for_write::lock()
+{
+    static_cast<rwlock*>(this)->wlock();
+}
+
+inline void rwlock_for_write::unlock()
+{
+    static_cast<rwlock*>(this)->wunlock();
+}
+
+#endif
 
 __BEGIN_DECLS
 void rwlock_init(rwlock_t* rw);

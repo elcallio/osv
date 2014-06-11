@@ -18,8 +18,6 @@
 #include <string.h>
 #include <osv/boot.hh>
 
-using namespace mmu;
-
 struct multiboot_info_type {
     u32 flags;
     u32 mem_lower;
@@ -82,7 +80,10 @@ void setup_temporary_phys_map()
     // duplicate 1:1 mapping into phys_mem
     u64 cr3 = processor::read_cr3();
     auto pt = reinterpret_cast<u64*>(cr3);
-    pt[pt_index(phys_mem, 3)] = pt[0];
+    for (auto&& area : mmu::identity_mapped_areas) {
+        auto base = get_mem_area_base(area);
+        pt[mmu::pt_index(base, 3)] = pt[0];
+    }
 }
 
 void for_each_e820_entry(void* e820_buffer, unsigned size, void (*f)(e820ent e))
@@ -146,6 +147,14 @@ void arch_setup_free_memory()
     time = (time << 32) | omb.tsc_disk_done;
     boot_time.arrays[1] = { "disk read (real mode)", time };
 
+    auto c = processor::cpuid(0x80000000);
+    if (c.a >= 0x80000008) {
+        c = processor::cpuid(0x80000008);
+        mmu::phys_bits = c.a & 0xff;
+        mmu::virt_bits = (c.a >> 8) & 0xff;
+        assert(mmu::phys_bits <= mmu::max_phys_bits);
+    }
+
     setup_temporary_phys_map();
 
     // setup all memory up to 1GB.  We can't free any more, because no
@@ -168,7 +177,10 @@ void arch_setup_free_memory()
         }
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
-    mmu::linear_map(mmu::phys_mem, 0, initial_map, initial_map);
+    for (auto&& area : mmu::identity_mapped_areas) {
+        auto base = get_mem_area_base(area);
+        mmu::linear_map(base, 0, initial_map, initial_map);
+    }
     // map the core, loaded 1:1 by the boot loader
     mmu::phys elf_phys = reinterpret_cast<mmu::phys>(elf_header);
     elf_start = reinterpret_cast<void*>(elf_header);
@@ -186,13 +198,20 @@ void arch_setup_free_memory()
         if (intersects(ent, initial_map)) {
             ent = truncate_below(ent, initial_map);
         }
-        mmu::linear_map(mmu::phys_mem + ent.addr, ent.addr, ent.size, ~0);
+        for (auto&& area : mmu::identity_mapped_areas) {
+            auto base = get_mem_area_base(area);
+            mmu::linear_map(base + ent.addr, ent.addr, ent.size, ~0);
+        }
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
 }
 
-void arch_setup_tls(thread_control_block *tcb)
+void arch_setup_tls(void *tls, void *start, size_t size)
 {
+    struct thread_control_block *tcb;
+    memcpy(tls, start, size);
+    tcb = (struct thread_control_block *)(tls + size);
+    tcb->self = tcb;
     processor::wrmsr(msr::IA32_FS_BASE, reinterpret_cast<uint64_t>(tcb));
 }
 
@@ -205,4 +224,62 @@ static inline void disable_pic()
 void arch_init_premain()
 {
     disable_pic();
+}
+
+#include "drivers/driver.hh"
+#include "drivers/pvpanic.hh"
+#include "drivers/virtio.hh"
+#include "drivers/virtio-blk.hh"
+#include "drivers/virtio-scsi.hh"
+#include "drivers/virtio-net.hh"
+#include "drivers/virtio-rng.hh"
+#include "drivers/xenfront-xenbus.hh"
+#include "drivers/ahci.hh"
+#include "drivers/vmw-pvscsi.hh"
+#include "drivers/vmxnet3.hh"
+#include "drivers/ide.hh"
+
+void arch_init_drivers()
+{
+    // initialize panic drivers
+    panic::pvpanic::probe_and_setup();
+    boot_time.event("pvpanic done");
+
+    // Enumerate PCI devices
+    pci::pci_device_enumeration();
+    boot_time.event("pci enumerated");
+
+    // Initialize all drivers
+    hw::driver_manager* drvman = hw::driver_manager::instance();
+    drvman->register_driver(virtio::blk::probe);
+    drvman->register_driver(virtio::scsi::probe);
+    drvman->register_driver(virtio::net::probe);
+    drvman->register_driver(virtio::rng::probe);
+    drvman->register_driver(xenfront::xenbus::probe);
+    drvman->register_driver(ahci::hba::probe);
+    drvman->register_driver(vmw::pvscsi::probe);
+    drvman->register_driver(vmw::vmxnet3::probe);
+    drvman->register_driver(ide::ide_drive::probe);
+    boot_time.event("drivers probe");
+    drvman->load_all();
+    drvman->list_drivers();
+}
+
+#include "drivers/console.hh"
+#include "drivers/isa-serial.hh"
+#include "drivers/vga.hh"
+
+bool arch_setup_console(std::string opt_console)
+{
+    if (opt_console.compare("serial") == 0) {
+        console::console_driver_add(new console::isa_serial_console());
+    } else if (opt_console.compare("vga") == 0) {
+        console::console_driver_add(new console::VGAConsole());
+    } else if (opt_console.compare("all") == 0) {
+        console::console_driver_add(new console::isa_serial_console());
+        console::console_driver_add(new console::VGAConsole());
+    } else {
+        return false;
+    }
+    return true;
 }

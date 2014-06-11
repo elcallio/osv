@@ -152,7 +152,9 @@ sys_open(char *path, int flags, mode_t mode, struct file **fpp)
 	    error = err;
 	    goto out_vn_unlock;
 	}
-	fp->f_dentry = dp;
+	// change to std::move once dp is a dentry_ref
+	fp->f_dentry = dentry_ref(dp, false);
+	dp = nullptr;
 
 	error = VOP_OPEN(vp, fp);
 	if (error)
@@ -167,7 +169,9 @@ out_free_fp:
 out_vn_unlock:
 	vn_unlock(vp);
 out_drele:
-	drele(dp);
+	if (dp) {
+		drele(dp);
+	}
 	return error;
 }
 
@@ -186,8 +190,8 @@ sys_read(struct file *fp, struct iovec *iov, size_t niov,
 	ssize_t bytes;
 	int error;
 
-	DPRINTF(VFSDB_SYSCALL, ("sys_write: fp=%x buf=%x size=%d\n",
-				(u_int)fp, (u_int)buf, size));
+	DPRINTF(VFSDB_SYSCALL, ("sys_write: fp=%x offset=%d\n",
+				(u_long)fp, (u_int)offset));
 
 	if ((fp->f_flags & FREAD) == 0)
 		return EBADF;
@@ -221,8 +225,8 @@ sys_write(struct file *fp, struct iovec *iov, size_t niov,
 	ssize_t bytes;
 	int error;
 
-	DPRINTF(VFSDB_SYSCALL, ("sys_write: fp=%x uio=%x niv=%zu\n",
-				(u_long)fp, (u_long)uio, niv));
+	DPRINTF(VFSDB_SYSCALL, ("sys_write: fp=%x uio=%x niov=%zu\n",
+				(u_long)fp, (u_long)uio, niov));
 
 	if ((fp->f_flags & FWRITE) == 0)
 		return EBADF;
@@ -254,7 +258,7 @@ sys_lseek(struct file *fp, off_t off, int type, off_t *origin)
 	struct vnode *vp;
 
 	DPRINTF(VFSDB_SYSCALL, ("sys_seek: fp=%x off=%d type=%d\n",
-				(u_int)fp, (u_int)off, type));
+				(u_long)fp, (u_int)off, type));
 
 	if (!fp->f_dentry) {
 	    // Linux doesn't implement lseek() on pipes, sockets, or ttys.
@@ -868,35 +872,32 @@ sys_access(char *path, int mode)
 int
 sys_stat(char *path, struct stat *st)
 {
-	struct dentry *dp;
-	int error;
-
 	DPRINTF(VFSDB_SYSCALL, ("sys_stat: path=%s\n", path));
 
-	error = namei(path, &dp);
-	if (error)
-		return error;
-	error = vn_stat(dp->d_vnode, st);
-	drele(dp);
-	return error;
+	try {
+		dentry_ref dp = namei(path);
+		if (!dp) {
+			return ENOENT;
+		}
+		return vn_stat(dp->d_vnode, st);
+	} catch (error e) {
+		return e.get();
+	}
 }
 
 int
 sys_statfs(char *path, struct statfs *buf)
 {
-	struct dentry *dp;
-	int error;
-
 	memset(buf, 0, sizeof(*buf));
-
-	error = namei(path, &dp);
-	if (error)
-		return error;
-
-	error = VFS_STATFS(dp->d_mount, buf);
-	drele(dp);
-
-	return error;
+	try {
+		dentry_ref dp = namei(path);
+		if (!dp) {
+			return ENOENT;
+		}
+		return VFS_STATFS(dp->d_mount, buf);
+	} catch (error e) {
+		return e.get();
+	}
 }
 
 int
@@ -1032,5 +1033,50 @@ sys_utimes(char *path, const struct timeval times[2])
     }
 
     drele(dp);
+    return error;
+}
+
+int
+sys_fallocate(struct file *fp, int mode, loff_t offset, loff_t len)
+{
+    int error;
+    struct vnode *vp;
+
+    DPRINTF(VFSDB_SYSCALL, ("sys_fallocate: fp=%x", fp));
+
+    if (!fp->f_dentry || !(fp->f_flags & FWRITE)) {
+        return EBADF;
+    }
+
+    if (offset < 0 || len <= 0) {
+        return EINVAL;
+    }
+
+    // Strange, but that's what Linux returns.
+    if ((mode & FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE)) {
+        return ENOTSUP;
+    }
+
+    vp = fp->f_dentry->d_vnode;
+    vn_lock(vp);
+
+    // NOTE: It's not detected here whether or not the device underlying
+    // the fs is a block device. It's up to the fs itself tell us whether
+    // or not fallocate is supported. See below:
+    if (vp->v_type != VREG && vp->v_type != VDIR) {
+        error = ENODEV;
+        goto ret;
+    }
+
+    // EOPNOTSUPP here means that the underlying file system
+    // referred by vp doesn't support fallocate.
+    if (!vp->v_op->vop_fallocate) {
+        error = EOPNOTSUPP;
+        goto ret;
+    }
+
+    error = VOP_FALLOCATE(vp, mode, offset, len);
+ret:
+    vn_unlock(vp);
     return error;
 }

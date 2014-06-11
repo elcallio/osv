@@ -14,6 +14,7 @@
 #include <thread>
 #include <boost/utility.hpp>
 #include <string.h>
+#include <lockfree/unordered-queue-mpsc.hh>
 #include "libc/libc.hh"
 #include <osv/align.hh>
 #include <osv/debug.hh>
@@ -31,10 +32,15 @@
 #include <osv/shrinker.h>
 #include "java/jvm_balloon.hh"
 
-TRACEPOINT(trace_memory_malloc, "buf=%p, len=%d", void *, size_t);
-TRACEPOINT(trace_memory_malloc_large, "buf=%p, len=%d", void *, size_t);
+TRACEPOINT(trace_memory_malloc, "buf=%p, len=%d, align=%d", void *, size_t,
+           size_t);
+TRACEPOINT(trace_memory_malloc_mempool, "buf=%p, req_len=%d, alloc_len=%d,"
+           " align=%d", void*, size_t, size_t, size_t);
+TRACEPOINT(trace_memory_malloc_large, "buf=%p, req_len=%d, alloc_len=%d,"
+           " align=%d", void*, size_t, size_t, size_t);
+TRACEPOINT(trace_memory_malloc_page, "buf=%p, req_len=%d, alloc_len=%d,"
+           " align=%d", void*, size_t, size_t, size_t);
 TRACEPOINT(trace_memory_free, "buf=%p", void *);
-TRACEPOINT(trace_memory_free_large, "buf=%p", void *);
 TRACEPOINT(trace_memory_realloc, "in=%p, newlen=%d, out=%p", void *, size_t, void *);
 TRACEPOINT(trace_memory_page_alloc, "page=%p", void*);
 TRACEPOINT(trace_memory_page_free, "page=%p", void*);
@@ -84,11 +90,12 @@ static inline void tracker_forget(void *addr)
 // sched::cpu::current() uses TLS which is set only later on.
 //
 
-static unsigned mempool_cpuid() {
-    unsigned c = (smp_allocator ? sched::cpu::current()->id: 0);
-    assert(c < 64);
-    return c;
+static inline unsigned mempool_cpuid() {
+    return (smp_allocator ? sched::cpu::current()->id: 0);
 }
+
+static void garbage_collector_fn();
+PCPU_WORKERITEM(garbage_collector, garbage_collector_fn);
 
 //
 // Since the small pools are managed per-cpu, malloc() always access the correct
@@ -104,57 +111,50 @@ static unsigned mempool_cpuid() {
 // 2nd index -> local cpu
 //
 
-const unsigned free_objects_ring_size = 256;
-typedef ring_spsc<void*, free_objects_ring_size> free_objects_type;
-free_objects_type ***pcpu_free_list;
-
-struct freelist_full_sync_object {
-    mutex _mtx;
-    condvar _cond;
-    void * _free_obj;
-};
-
-//
-// we use a pcpu sync object to synchronize between the freeing thread and the
-// worker item in the edge case of when the above ring is full.
-//
-// the sync object array performs as a secondary queue with the length of 1
-// item (_free_obj), and freeing threads will wait until it was handled by
-// the worker item. Their first priority is still to push the object to the
-// ring, only if they fail, a single thread may get a hold of,
-// _mtx and set _free_obj, all other threads will wait for the worker to drain
-// the its ring and this secondary 1-item queue.
-//
-freelist_full_sync_object freelist_full_sync[sched::max_cpus];
-
-static void free_worker_fn()
-{
-    unsigned cpu_id = mempool_cpuid();
-
-    // drain the ring, free all objects
-    for (unsigned i=0; i < sched::cpus.size(); i++) {
-        void* obj = nullptr;
-        while (pcpu_free_list[cpu_id][i]->pop(obj)) {
-            memory::pool::from_object(obj)->free(obj);
+class garbage_sink {
+private:
+    static const int signal_threshold = 256;
+    lockfree::unordered_queue_mpsc<free_object> queue;
+    int pushed_since_last_signal {};
+public:
+    void free(unsigned obj_cpu, free_object* obj)
+    {
+        queue.push(obj);
+        if (++pushed_since_last_signal > signal_threshold) {
+            garbage_collector.signal(sched::cpus[obj_cpu]);
+            pushed_since_last_signal = 0;
         }
     }
 
-    // handle secondary 1-item queue.
-    // if we have any waiters, wake them up
-    auto& sync = freelist_full_sync[cpu_id];
-    void* free_obj = nullptr;
-    WITH_LOCK(sync._mtx) {
-        free_obj = sync._free_obj;
-        sync._free_obj = nullptr;
+    free_object* pop()
+    {
+        return queue.pop();
     }
+};
 
-    if (free_obj) {
-        sync._cond.wake_all();
-        memory::pool::from_object(free_obj)->free(free_obj);
+static garbage_sink ***pcpu_free_list;
+
+void pool::collect_garbage()
+{
+    assert(!sched::preemptable());
+
+    unsigned cpu_id = mempool_cpuid();
+
+    for (unsigned i = 0; i < sched::cpus.size(); i++) {
+        auto sink = pcpu_free_list[cpu_id][i];
+        free_object* obj;
+        while ((obj = sink->pop())) {
+            memory::pool::from_object(obj)->free_same_cpu(obj, cpu_id);
+        }
     }
 }
 
-PCPU_WORKERITEM(free_worker, free_worker_fn);
+static void garbage_collector_fn()
+{
+    WITH_LOCK(preempt_lock) {
+        pool::collect_garbage();
+    }
+}
 
 // Memory allocation strategy
 //
@@ -188,7 +188,7 @@ pool::~pool()
 
 // FIXME: handle larger sizes better, while preserving alignment:
 const size_t pool::max_object_size = page_size / 2;
-const size_t pool::min_object_size = sizeof(pool::free_object);
+const size_t pool::min_object_size = sizeof(free_object);
 
 pool::page_header* pool::to_header(free_object* object)
 {
@@ -298,43 +298,12 @@ void pool::free_same_cpu(free_object* obj, unsigned cpu_id)
     }
 }
 
-void pool::free_different_cpu(free_object* obj, unsigned obj_cpu)
+void pool::free_different_cpu(free_object* obj, unsigned obj_cpu, unsigned cur_cpu)
 {
-    void* object = static_cast<void*>(obj);
-    trace_pool_free_different_cpu(this, object, obj_cpu);
-    free_objects_type *ring;
-
-    ring = memory::pcpu_free_list[obj_cpu][mempool_cpuid()];
-    if (!ring->push(object)) {
-        DROP_LOCK(preempt_lock) {
-            // The ring is full, take a mutex and use the sync object, hand
-            // the object to the secondary 1-item queue
-            auto& sync = freelist_full_sync[obj_cpu];
-            WITH_LOCK(sync._mtx) {
-                sync._cond.wait_until(sync._mtx, [&] {
-                    return (sync._free_obj == nullptr);
-                });
-
-                WITH_LOCK(preempt_lock) {
-                    ring = memory::pcpu_free_list[obj_cpu][mempool_cpuid()];
-                    if (!ring->push(object)) {
-                        // If the ring is full, use the secondary queue.
-                        // sync._free_obj is guaranteed null as we're
-                        // the only thread which broke out of the cond.wait
-                        // loop under the mutex
-                        sync._free_obj = object;
-                    }
-
-                    // Wake the worker item in case at least half of the queue is full
-                    if (ring->size() > free_objects_ring_size/2) {
-                        memory::free_worker.signal(sched::cpus[obj_cpu]);
-                    }
-                }
-            }
-        }
-    }
+    trace_pool_free_different_cpu(this, obj, obj_cpu);
+    auto sink = memory::pcpu_free_list[obj_cpu][cur_cpu];
+    sink->free(obj_cpu, obj);
 }
-
 
 void pool::free(void* object)
 {
@@ -354,7 +323,7 @@ void pool::free(void* object)
             // free from a different CPU. we try to hand the buffer
             // to the proper worker item that is pinned to the CPU that this buffer
             // was allocated from, so it'll free it.
-            free_different_cpu(obj, obj_cpu);
+            free_different_cpu(obj, obj_cpu, cur_cpu);
         }
     }
 }
@@ -379,20 +348,20 @@ struct mark_smp_allocator_intialized {
     mark_smp_allocator_intialized() {
         // FIXME: Handle CPU hot-plugging.
         auto ncpus = sched::cpus.size();
-        // Our malloc() is very coarse, and can use 2 pages for allocating a
-        // free_objects_type which is a little over half a page. So allocate
-        // all the queues in one large buffer.
-        auto buf = aligned_alloc(alignof(free_objects_type),
-                    sizeof(free_objects_type) * ncpus * ncpus);
-        pcpu_free_list = new free_objects_type**[ncpus];
+        // Our malloc() is very coarse so allocate all the queues in one large buffer.
+        // We allocate at least one page because current implementation of aligned_alloc()
+        // is not capable of ensuring aligned allocation for small allocations.
+        auto buf = aligned_alloc(alignof(garbage_sink),
+                    std::max(page_size, sizeof(garbage_sink) * ncpus * ncpus));
+        pcpu_free_list = new garbage_sink**[ncpus];
         for (auto i = 0U; i < ncpus; i++) {
-            pcpu_free_list[i] = new free_objects_type*[ncpus];
+            pcpu_free_list[i] = new garbage_sink*[ncpus];
             for (auto j = 0U; j < ncpus; j++) {
-                static_assert(!(sizeof(free_objects_type) %
-                        alignof(free_objects_type)), "free_objects_type align");
-                auto p = pcpu_free_list[i][j] = static_cast<free_objects_type *>(
-                        buf + sizeof(free_objects_type) * (i * ncpus + j));
-                new (p) free_objects_type;
+                static_assert(!(sizeof(garbage_sink) %
+                        alignof(garbage_sink)), "garbage_sink align");
+                auto p = pcpu_free_list[i][j] = static_cast<garbage_sink *>(
+                        buf + sizeof(garbage_sink) * (i * ncpus + j));
+                new (p) garbage_sink;
             }
         }
         smp_allocator = true;
@@ -564,8 +533,15 @@ void reclaimer::wait_for_memory(size_t mem)
 
 static void* malloc_large(size_t size, size_t alignment)
 {
-    size = (size + page_size - 1) & ~(page_size - 1);
-    size += page_size;
+    auto requested_size = size;
+    size_t offset;
+    if (alignment < page_size) {
+        offset = align_up(sizeof(page_range), alignment);
+    } else {
+        offset = page_size;
+    }
+    size += offset;
+    size = align_up(size, page_size);
 
     while (true) {
         WITH_LOCK(free_page_ranges_lock) {
@@ -597,8 +573,9 @@ static void* malloc_large(size_t size, size_t alignment)
                     }
                     on_alloc(size);
                     void* obj = ret_header;
-                    obj += page_size;
-                    trace_memory_malloc_large(obj, size);
+                    obj += offset;
+                    trace_memory_malloc_large(obj, requested_size, size,
+                                              alignment);
                     return obj;
                 }
             }
@@ -630,6 +607,7 @@ shrinker::shrinker(std::string name)
     }
 }
 
+extern "C"
 void *osv_register_shrinker(const char *name,
                             size_t (*func)(size_t target, bool hard))
 {
@@ -680,7 +658,7 @@ bool reclaimer_waiters::wake_waiters()
 // That means that this returning will only mean allocation may succeed, not
 // that it will.  Because of that, it is of extreme importance that callers
 // pass the exact amount of memory they are waiting for. So for instance, if
-// your allocation is 2Mb in size + a 4k header, "bytes" bellow should be 2Mb +
+// your allocation is 2Mb in size + a 4k header, "bytes" below should be 2Mb +
 // 4k, not 2Mb. Failing to do so could livelock the system, that would forever
 // wake up believing there is enough memory, when in reality there is not.
 void reclaimer_waiters::wait(size_t bytes)
@@ -771,7 +749,7 @@ void reclaimer::_do_reclaim()
         _shrinker_loop(target, [this] { return _oom_blocked.has_waiters(); });
 
         WITH_LOCK(free_page_ranges_lock) {
-            if (target > 0) {
+            if (target >= 0) {
                 // Wake up all waiters that are waiting and now have a chance to succeed.
                 // If we could not wake any, there is nothing really we can do.
                 if (!_oom_blocked.wake_waiters()) {
@@ -831,12 +809,13 @@ static void free_page_range(void *addr, size_t size)
 
 static void free_large(void* obj)
 {
-    free_page_range(static_cast<page_range*>(obj - page_size));
+    obj = align_down(obj - 1, page_size);
+    free_page_range(static_cast<page_range*>(obj));
 }
 
 static unsigned large_object_size(void *obj)
 {
-    obj -= page_size;
+    obj = align_down(obj - 1, page_size);
     auto header = static_cast<page_range*>(obj);
     return header->size;
 }
@@ -878,7 +857,7 @@ static void refill_page_buffer()
                 total_size += size;
                 void* pages = static_cast<void*>(p) + p->size;
                 if (!p->size) {
-                    free_page_ranges.erase(*p);
+                    free_page_ranges.erase(it);
                 }
                 while (size) {
                     pbuf.free[pbuf.nr++] = pages;
@@ -940,12 +919,13 @@ static void* early_alloc_page()
             abort();
         }
 
-        auto p = &*free_page_ranges.begin();
+        auto begin = free_page_ranges.begin();
+        auto p = &*begin;
         p->size -= page_size;
         on_alloc(page_size);
         void* page = static_cast<void*>(p) + p->size;
         if (!p->size) {
-            free_page_ranges.erase(*p);
+            free_page_ranges.erase(begin);
         }
         return page;
     }
@@ -1022,7 +1002,7 @@ void* alloc_huge_page(size_t N)
             size_t alloc_size;
             if (ret==v) {
                 alloc_size = range->size;
-                free_page_ranges.erase(*range);
+                free_page_ranges.erase(i);
             } else {
                 // Note that this is is done conditionally because we are
                 // operating page ranges. That is what is left on our page
@@ -1119,6 +1099,7 @@ extern "C" {
 // allocated from a pool.
 // FIXME: be less wasteful
 
+
 static inline void* std_malloc(size_t size, size_t alignment)
 {
     if ((ssize_t)size < 0)
@@ -1127,21 +1108,27 @@ static inline void* std_malloc(size_t size, size_t alignment)
 
     // Currently, we can't allocate a small object with large alignment,
     // so need to increase the allocation size.
+    auto requested_size = size;
     if (alignment > size) {
-        if (alignment <= memory::pool::max_object_size) {
+        if (alignment <= mmu::page_size) {
             size = alignment;
         } else {
-            size = std::max(size, memory::pool::max_object_size * 2);
+            size = std::max(size, mmu::page_size * 2);
         }
     }
 
-    if (size <= memory::pool::max_object_size) {
-        if (!smp_allocator) {
-            return memory::alloc_page() + memory::non_mempool_obj_offset;
-        }
+    if (size <= memory::pool::max_object_size && smp_allocator) {
         size = std::max(size, memory::pool::min_object_size);
         unsigned n = ilog2_roundup(size);
         ret = memory::malloc_pools[n].alloc();
+        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
+                                 ret);
+        trace_memory_malloc_mempool(ret, requested_size, 1 << n, alignment);
+    } else if (size <= mmu::page_size) {
+        ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page,
+                                       memory::alloc_page());
+        trace_memory_malloc_page(ret, requested_size, mmu::page_size,
+                                 alignment);
     } else {
         ret = memory::malloc_large(size, alignment);
     }
@@ -1163,10 +1150,17 @@ void* calloc(size_t nmemb, size_t size)
 
 static size_t object_size(void *object)
 {
-    if (reinterpret_cast<uintptr_t>(object) & (memory::page_size - 1)) {
-        return memory::pool::from_object(object)->get_size();
-    } else {
+    switch (mmu::get_mem_area(object)) {
+    case mmu::mem_area::main:
         return memory::large_object_size(object);
+    case mmu::mem_area::mempool:
+        object = mmu::translate_mem_area(mmu::mem_area::mempool,
+                                         mmu::mem_area::main, object);
+        return memory::pool::from_object(object)->get_size();
+    case mmu::mem_area::page:
+        return mmu::page_size;
+    default:
+        abort();
     }
 }
 
@@ -1196,14 +1190,19 @@ static inline void std_free(void* object)
         return;
     }
     memory::tracker_forget(object);
-    auto offset = reinterpret_cast<uintptr_t>(object) & (memory::page_size - 1);
-    if (offset == memory::non_mempool_obj_offset) {
-        memory::free_page(object - offset);
-    } else if (offset) {
+    switch (mmu::get_mem_area(object)) {
+    case mmu::mem_area::page:
+        object = mmu::translate_mem_area(mmu::mem_area::page,
+                                         mmu::mem_area::main, object);
+        return memory::free_page(object);
+    case mmu::mem_area::main:
+         return memory::free_large(object);
+    case mmu::mem_area::mempool:
+        object = mmu::translate_mem_area(mmu::mem_area::mempool,
+                                         mmu::mem_area::main, object);
         return memory::pool::from_object(object)->free(object);
-    } else {
-        trace_memory_free_large(object);
-        return memory::free_large(object);
+    default:
+        abort();
     }
 }
 
@@ -1315,7 +1314,7 @@ void* malloc(size_t size)
     void* buf = dbg::malloc(size, MALLOC_ALIGNMENT);
 #endif
 
-    trace_memory_malloc(buf, size);
+    trace_memory_malloc(buf, size, MALLOC_ALIGNMENT);
     return buf;
 }
 
@@ -1334,7 +1333,6 @@ void* realloc(void* obj, size_t size)
 void free(void* obj)
 {
     trace_memory_free(obj);
-
 #if CONF_debug_memory == 0
     std_free(obj);
 #else
@@ -1363,6 +1361,7 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 #else
     void* ret = dbg::malloc(size, alignment);
 #endif
+    trace_memory_malloc(ret, size, alignment);
     if (!ret) {
         return ENOMEM;
     }
@@ -1397,16 +1396,16 @@ void enable_debug_allocator()
 void* alloc_phys_contiguous_aligned(size_t size, size_t align)
 {
     assert(is_power_of_two(align));
-    // make use of the standard allocator returning properly aligned
+    // make use of the standard large allocator returning properly aligned
     // physically contiguous memory:
-    auto ret = std_malloc(size, align);
+    auto ret = malloc_large(size, align);
     assert (!(reinterpret_cast<uintptr_t>(ret) & (align - 1)));
     return ret;
 }
 
 void free_phys_contiguous_aligned(void* p)
 {
-    std_free(p);
+    free_large(p);
 }
 
 }

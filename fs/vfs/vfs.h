@@ -40,6 +40,7 @@
 #include <osv/mount.h>
 #include <osv/vnode.h>
 #include <osv/dentry.h>
+#include <osv/error.h>
 
 /*
  * Import vnode attributes flags
@@ -54,6 +55,8 @@
 #define FSMAXNAMES	16		/* max length of 'file system' name */
 
 #ifdef DEBUG_VFS
+#include <osv/debug.h>
+
 extern int vfs_debug;
 
 #define	VFSDB_CORE	0x00000001
@@ -114,6 +117,7 @@ int	 sys_statfs(char *path, struct statfs *buf);
 int	 sys_truncate(char *path, off_t length);
 ssize_t	 sys_readlink(char *path, char *buf, size_t bufsize);
 int  sys_utimes(char *path, const struct timeval times[2]);
+int  sys_fallocate(struct file *fp, int mode, loff_t offset, loff_t len);
 
 int	 sys_mount(char *dev, char *dir, char *fsname, int flags, void *data);
 int	 sys_umount2(const char *path, int flags);
@@ -150,5 +154,25 @@ void	 mount_dump(void);
 #endif
 
 __END_DECLS
+
+#ifdef __cplusplus
+
+// Convert a path to a dentry_ref.  Returns an empty
+// reference if not found (ENOENT) for efficiency, throws
+// an error on other errors.
+inline dentry_ref namei(char* path)
+{
+	dentry* dp;
+	auto err = namei(path, &dp);
+	if (err == ENOENT) {
+		return dentry_ref();
+	} else if (err) {
+		throw make_error(err);
+	} else {
+		return dentry_ref(dp, false);
+	}
+}
+
+#endif
 
 #endif /* !_VFS_H */

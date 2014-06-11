@@ -12,24 +12,61 @@
 
 #include <osv/barrier.hh>
 #include <string.h>
+#include "arch-setup.hh"
 
 extern "C" {
-void thread_main(void);
 void thread_main_c(sched::thread* t);
-void stack_trampoline(sched::thread* t, void (*func)(sched::thread*),
-                      void** stacktop);
 }
 
 namespace sched {
 
 void thread::switch_to()
 {
-    abort();
+    thread* old = current();
+    asm volatile ("msr tpidr_el0, %0; isb; " :: "r"(_tcb) : "memory");
+
+    asm volatile("\n"
+                 "str x29,     %0  \n"
+                 "mov x2, sp       \n"
+                 "adr x1, 1f       \n" /* address of label */
+                 "stp x2, x1,  %1  \n"
+
+                 "ldp x29, x0, %2  \n"
+                 "ldp x2, x1,  %3  \n"
+
+                 "mov sp, x2       \n"
+                 "blr x1           \n"
+
+                 "1:               \n" /* label */
+                 :
+                 : "Q"(old->_state.fp), "Ump"(old->_state.sp),
+                   "Ump"(this->_state.fp), "Ump"(this->_state.sp)
+                 : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+                   "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                   "x16", "x17", "x18", "x30", "memory");
 }
 
 void thread::switch_to_first()
 {
-    abort();
+    asm volatile ("msr tpidr_el0, %0; isb; " :: "r"(_tcb) : "memory");
+
+    /* check that the tls variable preempt_counter is correct */
+    assert(sched::get_preempt_counter() == 1);
+
+    s_current = this;
+    current_cpu = _detached_state->_cpu;
+    remote_thread_local_var(percpu_base) = _detached_state->_cpu->percpu_base;
+
+    asm volatile("\n"
+                 "ldp x29, x0, %0  \n"
+                 "ldp x2, x1, %1   \n"
+                 "mov sp, x2       \n"
+                 "blr x1           \n"
+                 :
+                 : "Ump"(this->_state.fp), "Ump"(this->_state.sp)
+                 : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+                   "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                   "x16", "x17", "x18", "x30", "memory");
 }
 
 void thread::init_stack()
@@ -43,30 +80,40 @@ void thread::init_stack()
         stack.deleter = stack.default_deleter;
     }
     void** stacktop = reinterpret_cast<void**>(stack.begin + stack.size);
-    _state.fp = this;
-    _state.pc = reinterpret_cast<void*>(thread_main);
+    _state.fp = 0;
+    _state.thread = this;
     _state.sp = stacktop;
+    _state.pc = reinterpret_cast<void*>(thread_main_c);
 }
 
 void thread::setup_tcb()
 {
     assert(tls.size);
+    void* p = malloc(sched::tls.size + 1024);
+    memset(p, 0, sched::tls.size + 1024);
 
-    void* p = malloc(sched::tls.size + sizeof(*_tcb));
-    memcpy(p, sched::tls.start, sched::tls.size);
-    _tcb = static_cast<thread_control_block*>(p + tls.size);
-    _tcb->self = _tcb;
-    _tcb->tls_base = p;
+    _tcb = (thread_control_block *)p;
+    _tcb[0].tls_base = &_tcb[1];
+    memcpy(&_tcb[1], sched::tls.start, sched::tls.size);
 }
 
 void thread::free_tcb()
 {
-    free(_tcb->tls_base);
+    free(_tcb);
 }
 
 void thread_main_c(thread* t)
 {
-    abort();
+    debug_early_u64("thread_main_c: thread* t=", (u64)t);
+
+    arch::irq_enable();
+
+#ifdef CONF_preempt
+    preempt_enable();
+#endif
+
+    t->main();
+    t->complete();
 }
 
 }

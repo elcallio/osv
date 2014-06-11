@@ -12,7 +12,7 @@
 #include "arch-thread-state.hh"
 #include "arch-cpu.hh"
 #include <functional>
-#include <osv/tls.hh>
+#include "arch-tls.hh"
 #include "drivers/clockevent.hh"
 #include <boost/intrusive/set.hpp>
 #include <boost/intrusive/list.hpp>
@@ -24,14 +24,9 @@
 #include <vector>
 #include <osv/rcu.hh>
 #include <osv/clock.hh>
+#include <osv/timer-set.hh>
 
-// If RUNTIME_PSEUDOFLOAT, runtime_t is a pseudofloat<>. Otherwise, a float.
-#undef RUNTIME_PSEUDOFLOAT
-#ifdef RUNTIME_PSEUDOFLOAT
-#include <osv/pseudofloat.hh>
-#else
 typedef float runtime_t;
-#endif
 
 extern "C" {
 void smp_main();
@@ -93,7 +88,8 @@ public:
     cpu_set fetch_clear() {
         cpu_set ret;
         if (_mask.load(std::memory_order_relaxed)) {
-            ret._mask = _mask.exchange(0, std::memory_order_acquire);
+            ret._mask.store(_mask.exchange(0, std::memory_order_acquire),
+                            std::memory_order_relaxed);
         }
         return ret;
     }
@@ -153,7 +149,12 @@ private:
     std::atomic<unsigned long> _mask;
 };
 
-class timer_base : public bi::set_base_hook<>, public bi::list_base_hook<> {
+class timer_base {
+public:
+    bi::list_member_hook<> hook;
+    bi::list_member_hook<> client_hook;
+    using client_list_t = bi::list<timer_base,
+        bi::member_hook<timer_base, bi::list_member_hook<>, &timer_base::client_hook>>;
 public:
     class client {
     public:
@@ -163,7 +164,7 @@ public:
         void resume_timers();
     private:
         bool _timers_need_reload = false;
-        bi::list<timer_base> _active_timers;
+        client_list_t _active_timers;
         friend class timer_base;
     };
 public:
@@ -186,6 +187,9 @@ public:
     template <class Rep, class Period>
     void set(std::chrono::duration<Rep, Period> duration) {
         set(osv::clock::uptime::now() + duration);
+    }
+    osv::clock::uptime::time_point get_timeout() {
+        return _time;
     }
     bool expired() const;
     void cancel();
@@ -221,6 +225,7 @@ private:
     timer& _tmr;
 };
 
+extern thread __thread * s_current;
 // thread_runtime is used to maintain the scheduler's view of the thread's
 // priority relative to other threads. It knows about a static priority of the
 // thread (allowing a certain thread to get more runtime than another threads)
@@ -403,7 +408,11 @@ public:
     static void sleep(std::chrono::duration<Rep, Period> duration);
     static void yield();
     static void exit() __attribute__((__noreturn__));
-    static thread* current() __attribute((no_instrument_function));
+#ifdef __OSV_CORE__
+    static inline thread* current() { return s_current; };
+#else
+    static thread* current();
+#endif
     stack_info get_stack_info();
     cpu* tcpu() const __attribute__((no_instrument_function));
     void join();
@@ -556,7 +565,6 @@ private:
     attr _attr;
     int _migration_lock_counter;
     arch_thread _arch;
-    arch_fpu _fpu;
     unsigned int _id;
     std::atomic<bool> _interrupted;
     std::function<void ()> _cleanup;
@@ -578,7 +586,7 @@ private:
     friend void init(std::function<void ()> cont);
 public:
     std::atomic<thread *> _joiner;
-    thread_runtime::duration thread_clock() { return _total_cpu_time; }
+    thread_runtime::duration thread_clock();
     bi::set_member_hook<> _runqueue_link;
     // see cpu class
     lockless_queue_link<thread> _wakeup_link;
@@ -631,14 +639,14 @@ void init_detached_threads_reaper();
 class timer_list {
 public:
     void fired();
-    void suspend(bi::list<timer_base>& t);
-    void resume(bi::list<timer_base>& t);
+    void suspend(timer_base::client_list_t& t);
+    void resume(timer_base::client_list_t& t);
     void rearm();
 private:
     friend class timer_base;
     osv::clock::uptime::time_point _last {
             osv::clock::uptime::time_point::max() };
-    bi::set<timer_base, bi::base_hook<bi::set_base_hook<>>> _list;
+    timer_set<timer_base, &timer_base::hook, osv::clock::uptime> _list;
     class callback_dispatch : private clock_event_callback {
     public:
         callback_dispatch();
@@ -694,7 +702,7 @@ struct cpu : private timer_base::client {
     void send_wakeup_ipi();
     void load_balance();
     unsigned load();
-    void reschedule_from_interrupt(bool preempt = false);
+    void reschedule_from_interrupt();
     void enqueue(thread& t);
     void init_idle_thread();
     virtual void timer_fired() override;
@@ -716,11 +724,6 @@ private:
     static std::list<notifier*> _notifiers;
     friend struct cpu;
 };
-
-void preempt();
-void preempt_disable() __attribute__((no_instrument_function));
-void preempt_enable() __attribute__((no_instrument_function));
-bool preemptable() __attribute__((no_instrument_function));
 
 thread* current();
 
@@ -785,6 +788,53 @@ inline void release(mutex_t* mtx)
         mutex_unlock(mtx);
     }
 }
+
+extern unsigned __thread preempt_counter;
+extern bool __thread need_reschedule;
+
+#ifdef __OSV_CORE__
+inline unsigned int get_preempt_counter()
+{
+    barrier();
+    return preempt_counter;
+}
+
+inline bool preemptable()
+{
+    return !get_preempt_counter();
+}
+
+inline void preempt()
+{
+    if (preemptable()) {
+        sched::cpu::current()->reschedule_from_interrupt();
+    } else {
+        // preempt_enable() will pick this up eventually
+        need_reschedule = true;
+    }
+}
+
+inline void preempt_disable()
+{
+    ++preempt_counter;
+    barrier();
+}
+
+inline void preempt_enable()
+{
+    barrier();
+    --preempt_counter;
+    if (preemptable() && need_reschedule && arch::irq_enabled()) {
+        cpu::schedule();
+    }
+}
+#else
+unsigned int get_preempt_counter();
+bool preemptable();
+void preempt();
+void preempt_disable();
+void preempt_enable();
+#endif
 
 class interruptible
 {
@@ -1073,10 +1123,12 @@ extern std::vector<cpu*> cpus;
 inline void migrate_disable()
 {
     thread::current()->_migration_lock_counter++;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
 inline void migrate_enable()
 {
+    std::atomic_signal_fence(std::memory_order_release);
     thread::current()->_migration_lock_counter--;
 }
 

@@ -31,10 +31,28 @@ First, install prerequisite packages:
 yum install ant autoconf automake boost-static gcc-c++ genromfs libvirt libtool flex bison qemu-system-x86 qemu-img maven maven-shade-plugin python-dpkt tcpdump gdb
 ```
 
-**Debian**
+**Debian stable(wheezy)**
+Debian stable(wheezy) requires to compile gcc, gdb and qemu.
+And also need to configure bridge manually.
 
+More details are available on wiki page:
+[Building OSv on Debian stable][]
+
+[Building OSv on Debian stable]: https://github.com/cloudius-systems/osv/wiki/Building-OSv-on-Debian-stable
+
+**Debian testing(jessie)**
 ```
-apt-get install build-essential libboost-all-dev genromfs autoconf libtool openjdk-7-jdk ant qemu-utils maven libmaven-shade-plugin-java python-dpkt tcpdump gdb
+apt-get install build-essential libboost-all-dev genromfs autoconf libtool openjdk-7-jdk ant qemu-utils maven libmaven-shade-plugin-java python-dpkt tcpdump gdb qemu-system-x86
+```
+
+**Arch Linux**
+```
+pacman -S base-devel git python apache-ant maven qemu gdb boost
+```
+
+Before start building OSv, you'll need to add your account to kvm group.
+```
+usermod -aG kvm <user name>
 ```
 
 **Ubuntu users**: you may use [Oracle JDK][] if you don't want to pull too many
@@ -61,6 +79,19 @@ By default make creates image in qcow2 format. To change this pass format value 
 
 ```
 make img_format=raw
+```
+
+By default make will use the static libraries of gcc in external submodule. To change this pass `host` via *_env variables:
+
+```
+make build_env=host
+```
+
+This will use static libraries in the system instead (make sure they are installed before run `make`),
+if you only want to use C++ static libraries in the system, just set `cxx_lib_env` to `host`:
+
+```
+make cxx_lib_env=host
 ```
 
 ## Running OSv

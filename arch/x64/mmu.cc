@@ -11,10 +11,14 @@
 #include <osv/mmu.hh>
 #include <osv/irqlock.hh>
 #include <osv/interrupt.hh>
+#include <osv/migration-lock.hh>
 #include <osv/prio.hh>
+#include "exceptions.hh"
 
 void page_fault(exception_frame *ef)
 {
+    sched::fpu_lock fpu;
+    SCOPE_LOCK(fpu);
     sched::exception_guard g;
     auto addr = processor::read_cr2();
     if (fixup_fault(ef)) {
@@ -31,14 +35,13 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
-        sched::inplace_arch_fpu fpu;
-        fpu.save();
         mmu::vm_fault(addr, ef);
-        fpu.restore();
     }
 }
 
 namespace mmu {
+
+uint8_t phys_bits = max_phys_bits, virt_bits = 52;
 
 void flush_tlb_local() {
     // TODO: we can use page_table_root instead of read_cr3(), can be faster
@@ -63,9 +66,13 @@ inter_processor_interrupt tlb_flush_ipi{[] {
 
 void flush_tlb_all()
 {
-    mmu::flush_tlb_local();
-    if (sched::cpus.size() <= 1)
+    if (sched::cpus.size() <= 1) {
+        mmu::flush_tlb_local();
         return;
+    }
+
+    SCOPE_LOCK(migration_lock);
+    mmu::flush_tlb_local();
     std::lock_guard<mutex> guard(tlb_flush_mutex);
     tlb_flush_waiter.reset(*sched::thread::current());
     tlb_flush_pendingconfirms.store((int)sched::cpus.size() - 1);
@@ -131,6 +138,10 @@ bool is_page_fault_write(unsigned int error_code) {
     return error_code & page_fault_write;
 }
 
+bool is_page_fault_rsvd(unsigned int error_code) {
+    return error_code & page_fault_rsvd;
+}
+
 /* Glauber Costa: if page faults because we are trying to execute code here,
  * we shouldn't be closing the balloon. We should [...] despair.
  * So by checking only for == page_fault_write, we are guaranteed to close
@@ -144,4 +155,24 @@ bool is_page_fault_write_exclusive(unsigned int error_code) {
     return error_code == page_fault_write;
 }
 
+bool is_page_fault_prot_write(unsigned int error_code) {
+    return (error_code & (page_fault_write | page_fault_prot)) == (page_fault_write | page_fault_prot);
+}
+
+bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef)
+{
+    if (is_page_fault_rsvd(ef->get_error())) {
+        return true;
+    }
+
+    // if page is present, but write protected without cow bit set
+    // it means that this address belong to PROT_READ vma, so no need
+    // to search vma to verify permission
+    if (is_page_fault_prot_write(ef->get_error())) {
+        auto pte = virt_to_pte_rcu(addr);
+        return !pte_is_cow(pte) && !pte.writable();
+    }
+
+    return false;
+}
 }

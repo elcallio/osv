@@ -11,6 +11,7 @@ from collections import defaultdict
 from operator import attrgetter
 
 from osv import trace, debug, prof
+import memory_analyzer
 
 class InvalidArgumentsException(Exception):
     def __init__(self, message):
@@ -108,6 +109,31 @@ def list_trace(args):
             if t.time in time_range:
                 print t.format(backtrace_formatter, data_formatter=data_formatter)
 
+def mem_analys(args):
+    mallocs = {}
+
+    node_filters = []
+    if args.min_count:
+        node_filters.append(memory_analyzer.filter_min_count(args.min_count))
+    if args.min_hits:
+        if args.min_hits.endswith('%'):
+            min_percent = parse_percentage(args.min_hits)
+            node_filters.append(memory_analyzer.filter_min_bt_percentage(min_percent))
+        else:
+            min_count = int(args.min_hits)
+            node_filters.append(memory_analyzer.filter_min_bt_count(min_count))
+
+    with get_trace_reader(args) as reader:
+        memory_analyzer.process_records(mallocs, reader.get_traces())
+        memory_analyzer.show_results(mallocs,
+            node_filters=node_filters,
+            sorter=args.sort,
+            group_by=args.group_by,
+            show_backtrace=args.backtrace,
+            symbol_resolver=symbol_resolver(args),
+            src_addr_formatter=src_addr_formatter(args),
+            max_levels=args.max_levels)
+
 def add_time_slicing_options(parser):
     group = parser.add_argument_group('time slicing')
     group.add_argument("--since", action='store', help="show data starting on this timestamp [ns]")
@@ -122,6 +148,11 @@ groupers = {
     'none': lambda: None,
 }
 
+def add_backtrace_options(parser):
+    parser.add_argument("--min-hits", action='store',
+        help="show only nodes with hit count not smaller than this. can be absolute number or a percentage, eg. 10%%")
+    parser.add_argument("--max-levels", type=int, action='store', help="maximum number of tree levels to show")
+
 def add_profile_options(parser):
     add_time_slicing_options(parser)
     group = parser.add_argument_group('profile options')
@@ -129,9 +160,7 @@ def add_profile_options(parser):
     group.add_argument("-g", "--group-by", choices=groupers.keys(), default='none', help="group samples by given criteria")
     group.add_argument("--function", action='store', help="use given function as tree root")
     group.add_argument("--min-duration", action='store', help="show only nodes with resident time not shorter than this, eg: 200ms")
-    group.add_argument("--min-hits", action='store',
-        help="show only nodes with hit count not smaller than this. can be absolute number or a percentage, eg. 10%%")
-    group.add_argument("--max-levels", type=int, action='store', help="maximum number of tree levels to show")
+    add_backtrace_options(group)
 
 class sample_name_is(object):
     def __init__(self, name):
@@ -144,8 +173,9 @@ def get_wait_profile(traces):
     return prof.get_duration_profile(traces, sample_name_is("sched_wait"))
 
 def get_time_range(args):
-    start = prof.parse_time_as_nanos(args.since) if args.since else None
-    end = prof.parse_time_as_nanos(args.until) if args.until else None
+    default_unit = 's'
+    start = prof.parse_time_as_nanos(args.since, default_unit=default_unit) if args.since else None
+    end = prof.parse_time_as_nanos(args.until, default_unit=default_unit) if args.until else None
 
     if args.period:
         if start and end:
@@ -227,6 +257,9 @@ def extract(args):
             os.remove(args.tracefile)
             assert(not os.path.exists(args.tracefile))
         cmdline = ['gdb', elf_path, '-batch']
+        # enable adding OSv's python modules to gdb, see
+        # http://sourceware.org/gdb/onlinedocs/gdb/Auto_002dloading-safe-path.html
+        cmdline.extend(['-iex', 'set auto-load safe-path .'])
         if args.remote:
             cmdline.extend(['-ex', 'target remote ' + args.remote])
         else:
@@ -362,6 +395,7 @@ def format_duration(nanos):
     return "%4.3f" % (float(nanos) / 1e6)
 
 def print_summary(args, printer=sys.stdout.write):
+    time_range = get_time_range(args)
     timed_producer = prof.timed_trace_producer()
     timed_samples = []
 
@@ -372,15 +406,16 @@ def print_summary(args, printer=sys.stdout.write):
 
     with get_trace_reader(args) as reader:
         for t in reader.get_traces():
-            count += 1
-            count_per_tp[t.tp] += 1
+            if t.time in time_range:
+                count += 1
+                count_per_tp[t.tp] += 1
 
-            if not min_time:
-                min_time = t.time
-            else:
-                min_time = min(min_time, t.time)
+                if not min_time:
+                    min_time = t.time
+                else:
+                    min_time = min(min_time, t.time)
 
-            max_time = max(max_time, t.time)
+                max_time = max(max_time, t.time)
 
             if args.timed:
                 timed = timed_producer(t)
@@ -409,6 +444,8 @@ def print_summary(args, printer=sys.stdout.write):
         format = "  %-20s %8s %8s %8s %8s %8s %8s %8s %15s"
         print "\nTimed tracepoints [ms]:\n"
 
+        timed_samples = filter(lambda t: t.time_range.intersection(time_range), timed_samples)
+
         if not timed_samples:
             print "  None"
         else:
@@ -416,7 +453,7 @@ def print_summary(args, printer=sys.stdout.write):
             print format % ("----", "-----", "---", "---", "---", "---", "-----", "---", "-----")
 
             for name, traces in get_timed_traces_per_function(timed_samples).iteritems():
-                    samples = sorted(map(attrgetter('duration'), traces))
+                    samples = sorted(list((t.time_range.intersection(time_range).length() for t in traces)))
                     print format % (
                         name,
                         len(samples),
@@ -483,6 +520,7 @@ if __name__ == "__main__":
     cmd_summary = subparsers.add_parser("summary", help="print trace summery", description="""
         Prints basic statistics about the trace.
         """)
+    add_time_slicing_options(cmd_summary)
     add_trace_source_options(cmd_summary)
     cmd_summary.add_argument("--timed", action="store_true", help="print percentile table of timed trace samples")
     cmd_summary.set_defaults(func=print_summary)
@@ -540,6 +578,28 @@ if __name__ == "__main__":
     cmd_tcpdump = subparsers.add_parser("tcpdump")
     add_trace_source_options(cmd_tcpdump)
     cmd_tcpdump.set_defaults(func=tcpdump, paginate=True)
+
+    cmd_memory_analyzer = subparsers.add_parser("memory-analyzer",
+        help="show memory allocation analysis", description="""
+        Prints profile showing number of memory allocations, their size, alignment and allocator.
+        Requires memory_* tracepoints enabled.
+        """)
+    add_trace_source_options(cmd_memory_analyzer)
+    cmd_memory_analyzer.add_argument("--min-count", action='store', type=int,
+        help="show only allocations at least as frequent as the specified threshold")
+    cmd_memory_analyzer.add_argument("-s", "--sort",
+        choices=memory_analyzer.sorters, default='size',
+           help='sort allocations by given criteria')
+    cmd_memory_analyzer.add_argument("-g", "--group-by",
+        choices=memory_analyzer.groups, action='store',
+        default=['allocator', 'alignment', 'allocated', 'requested'],
+        nargs='*', help='groups allocations by given criteria')
+    cmd_memory_analyzer.add_argument("--no-backtrace", action="store_false",
+        default=True, dest='backtrace', help="never show backtrace")
+    add_symbol_resolution_options(cmd_memory_analyzer)
+    group = cmd_memory_analyzer.add_argument_group('backtrace options')
+    add_backtrace_options(group)
+    cmd_memory_analyzer.set_defaults(func=mem_analys, paginate=True)
 
     args = parser.parse_args()
 

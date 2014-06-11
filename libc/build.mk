@@ -44,6 +44,7 @@ libc += ctype/wcwidth.o
 
 libc += dirent/alphasort.o
 libc += dirent/scandir.o
+libc += dirent/fdopendir.o
 
 libc += env/__environ.o
 libc += env/clearenv.o
@@ -342,6 +343,8 @@ libc += misc/getsubopt.o
 libc += misc/realpath.o
 libc += misc/backtrace.o
 libc += misc/uname.o
+libc += misc/lockf.o
+libc += misc/mntent.o
 
 libc += multibyte/btowc.o
 libc += multibyte/internal.o
@@ -376,9 +379,16 @@ libc += network/inet_pton.o
 libc += network/inet_ntop.o
 libc += network/proto.o
 libc += network/if_indextoname.o
+libc += network/gai_strerror.o
+libc += network/h_errno.o
 
 libc += prng/rand.o
 libc += prng/random.o
+
+libc += process/execve.o
+libc += process/execle.o
+libc += process/execv.o
+libc += process/execl.o
 
 libc += arch/$(arch)/setjmp/setjmp.o
 libc += arch/$(arch)/setjmp/longjmp.o
@@ -387,6 +397,12 @@ libc += arch/$(arch)/setjmp/sigrtmin.o
 libc += arch/$(arch)/setjmp/siglongjmp.o
 libc += arch/$(arch)/setjmp/sigsetjmp.o
 libc += arch/$(arch)/setjmp/block.o
+ifeq ($(arch),x64)
+libc += arch/$(arch)/ucontext/getcontext.o
+libc += arch/$(arch)/ucontext/setcontext.o
+libc += arch/$(arch)/ucontext/start_context.o
+libc += arch/$(arch)/ucontext/ucontext.o
+endif
 
 libc += stdio/__fclose_ca.o
 libc += stdio/__fdopen.o

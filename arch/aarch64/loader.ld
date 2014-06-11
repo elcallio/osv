@@ -51,10 +51,18 @@ SECTIONS
         text_start = .;
         *(.text.unlikely .text.*_unlikely .text.unlikely.*)
         *(.text.exit .text.exit.*)
+        *(.text.fixup)
         *(.text.startup .text.startup.*)
         *(.text.hot .text.hot.*)
         *(.text .stub .text.* .gnu.linkonce.t.*)
         text_end = .;
+    } : text
+
+    . = ALIGN(16);
+    .fixup : {
+        fault_fixup_start = .;
+        *(.fixup)
+        fault_fixup_end = .;
     } : text
 
     .eh_frame : { *(.eh_frame) } : text
@@ -93,15 +101,16 @@ SECTIONS
         *(.percpu_workers)
         _percpu_workers_end = .;
     }
-
-    .tdata : ALIGN(64) { *(.tdata .tdata.* .gnu.linkonce.td.*) } : tls : text
-    .tbss : ALIGN(64) { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) } : tls : text
+    /* do not align tdata, tbss with .tdata : ALIGN (64),
+       or the linker will offset the TLS loads accordingly! */
+    .tdata : { *(.tdata .tdata.* .gnu.linkonce.td.*) } : tls : text
+    .tbss : { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) } : tls : text
     .tls_template_size = SIZEOF(.tdata) + SIZEOF(.tbss);
     .bss : { *(.dynbss .bss .bss.* .gnu.linkonce.b.*) } : text
 
     . = ALIGN(64);
     tcb0 = .;
-    . = . + .tls_template_size + 256;
+    . = . + .tls_template_size + 1024;
     . = ALIGN(4096);
     .edata = .;
 

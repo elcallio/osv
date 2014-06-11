@@ -36,11 +36,13 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <api/poll.h>
 
 #include <osv/mutex.h>
 #include <osv/uio.h>
 
 #include <bsd/sys/sys/queue.h>
+#include <osv/dentry.h>
 
 #ifdef __cplusplus
 
@@ -49,6 +51,8 @@
 #include <osv/addr_range.hh>
 #include <osv/rcu.hh>
 #include <osv/error.h>
+#include <osv/clock.hh>
+#include <boost/optional/optional.hpp>
 
 #include "arch-mmu.hh"
 
@@ -81,6 +85,11 @@ class file_vma;
  * File structure
  */
 struct file {
+	using clock = osv::clock::uptime;
+	using timeout_t = boost::optional<clock::time_point>;
+
+	static int poll_many(struct pollfd pfd[], nfds_t nfds, timeout_t timeout);
+
 	file(unsigned flags, filetype_t type, void *opaque = nullptr);
 	virtual ~file();
 	void operator delete(void *p) { osv::rcu_dispose(p); }
@@ -90,6 +99,9 @@ struct file {
 	virtual int truncate(off_t len) = 0;
 	virtual int ioctl(u_long com, void *data) = 0;
 	virtual int poll(int events) = 0;
+	virtual int poll_sync(struct pollfd& pfd, timeout_t timeout) {
+		return poll_many(&pfd, 1, timeout);
+	}
 	virtual int stat(struct stat* buf) = 0;
 	virtual int close() = 0;
 	virtual int chmod(mode_t mode) = 0;
@@ -98,13 +110,16 @@ struct file {
 	virtual std::unique_ptr<mmu::file_vma> mmap(addr_range range, unsigned flags, unsigned perm, off_t offset) {
 	    throw make_error(ENODEV);
 	}
-	virtual bool map_page(uintptr_t offset, size_t size, mmu::hw_ptep ptep, mmu::pt_element pte, bool write, bool shared) { throw make_error(ENOSYS); }
-	virtual bool put_page(void *addr, uintptr_t offset, size_t size, mmu::hw_ptep ptep) { throw make_error(ENOSYS); }
+	virtual bool map_page(uintptr_t offset, mmu::hw_ptep<0> ptep, mmu::pt_element pte, bool write, bool shared) { throw make_error(ENOSYS); }
+	virtual bool map_page(uintptr_t offset, mmu::hw_ptep<1> ptep, mmu::pt_element pte, bool write, bool shared) { throw make_error(ENOSYS); }
+	virtual bool put_page(void *addr, uintptr_t offset, mmu::hw_ptep<0> ptep) { throw make_error(ENOSYS); }
+	virtual bool put_page(void *addr, uintptr_t offset, mmu::hw_ptep<1> ptep) { throw make_error(ENOSYS); }
+	virtual void sync(off_t start, off_t end) { throw make_error(ENOSYS); }
 
 	int		f_flags;	/* open flags */
 	int		f_count;	/* reference count, see below */
 	off_t		f_offset = 0;	/* current position in file */
-	struct dentry	*f_dentry = nullptr; /* dentry */
+	dentry_ref	f_dentry;	/* dentry */
 	void		*f_data;        /* file descriptor specific data */
 	filetype_t	f_type;		/* descriptor type */
 	TAILQ_HEAD(, poll_link) f_poll_list; /* poll request list */
@@ -114,6 +129,7 @@ struct file {
 	// Once we have a real epoll() implementation, it won't be needed.
 	int poll_wake_count = 0;
 };
+
 
 // struct file above is an abstract class; subclasses need to implement 8
 // methods. struct special_file defines a reasonable default implementation
@@ -130,6 +146,11 @@ struct special_file : public file {
     virtual int poll(int events) override;
     virtual int stat(struct stat* buf) override;
     virtual int chmod(mode_t mode) override;
+};
+
+struct tty_file : public special_file {
+    tty_file(unsigned flags, filetype_t type) :
+        special_file(flags, type) { }
 };
 
 #endif

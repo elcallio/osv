@@ -25,6 +25,21 @@
 #include <stdlib.h>
 #include <unordered_map>
 #include <osv/wait_record.hh>
+#include <osv/preempt-lock.hh>
+
+// By taking the address of these functions, we force the compiler to generate
+// a symbol for it even when the function is inlined into all call sites. In a
+// situation like that, the symbol would simply not be generated. That seems to
+// be true even if we use "inline" instead of "static inline"
+#define __MAKE_SYMBOL(name, num) static void *__address_##num __attribute__((used)) = (void *)&name
+#define _MAKE_SYMBOL(name, num) __MAKE_SYMBOL(name, num)
+#define MAKE_SYMBOL(name) _MAKE_SYMBOL(name, __COUNTER__)
+MAKE_SYMBOL(sched::thread::current);
+MAKE_SYMBOL(sched::get_preempt_counter);
+MAKE_SYMBOL(sched::preemptable);
+MAKE_SYMBOL(sched::preempt);
+MAKE_SYMBOL(sched::preempt_disable);
+MAKE_SYMBOL(sched::preempt_enable);
 
 __thread char* percpu_base;
 
@@ -181,30 +196,8 @@ void cpu::schedule()
     }
 }
 
-// In the x86 ABI, the FPU state is callee-saved, meaning that a program must
-// not call a function in the middle of an FPU calculation. But if we get a
-// preemption, i.e., the scheduler is called by an interrupt, the currently
-// running thread might be in the middle of a floating point calculation,
-// which we must not trample over.
-// When the scheduler code itself doesn't use the FPU (!scheduler_uses_fpu),
-// we need to save the running thread's FPU state only before switching to
-// a different thread (and restore this thread's FPU state when coming back
-// to this thread). However, if the scheduler itself uses the FPU in its
-// calculations (scheduler_uses_fpu), we always (when in preemption) need
-// to save and restore this thread's FPU state when we enter and exit the
-// scheduler.
-#ifdef RUNTIME_PSEUDOFLOAT
-static constexpr bool scheduler_uses_fpu = false;
-#else
-static constexpr bool scheduler_uses_fpu = true;
-#endif
-
-void cpu::reschedule_from_interrupt(bool preempt)
+void cpu::reschedule_from_interrupt()
 {
-    if (scheduler_uses_fpu && preempt) {
-        thread::current()->_fpu.save();
-    }
-
     assert(sched::exception_depth <= 1);
     need_reschedule = false;
     handle_incoming_wakeups();
@@ -231,9 +224,6 @@ void cpu::reschedule_from_interrupt(bool preempt)
         // lowest runtime, and update the timer until the next thread's turn.
         if (runqueue.empty()) {
             preemption_timer.cancel();
-            if (scheduler_uses_fpu && preempt) {
-                p->_fpu.restore();
-            }
             return;
         } else {
             auto &t = *runqueue.begin();
@@ -242,9 +232,6 @@ void cpu::reschedule_from_interrupt(bool preempt)
                 auto delta = p->_runtime.time_until(t._runtime.get_local());
                 if (delta > 0) {
                     preemption_timer.set(now + delta);
-                }
-                if (scheduler_uses_fpu && preempt) {
-                    p->_fpu.restore();
                 }
                 return;
             }
@@ -270,14 +257,6 @@ void cpu::reschedule_from_interrupt(bool preempt)
 
     assert(n!=p);
 
-    if (preempt) {
-        trace_sched_preempt();
-        if (!scheduler_uses_fpu) {
-            // If runtime is not a float, we only need to save the FPU here,
-            // just when deciding to switch threads.
-            p->_fpu.save();
-        }
-    }
     if (p->_detached_state->st.load(std::memory_order_relaxed) == thread::status::queued
             && p != idle_thread) {
         n->_runtime.add_context_switch_penalty();
@@ -294,10 +273,6 @@ void cpu::reschedule_from_interrupt(bool preempt)
     if (p->_detached_state->_cpu->terminating_thread) {
         p->_detached_state->_cpu->terminating_thread->destroy();
         p->_detached_state->_cpu->terminating_thread = nullptr;
-    }
-
-    if (preempt) {
-        p->_fpu.restore();
     }
 }
 
@@ -381,13 +356,12 @@ void cpu::handle_incoming_wakeups()
         return;
     }
     for (auto i : queues_with_wakes) {
-        incoming_wakeup_queue q;
-        incoming_wakeups[i].copy_and_clear(q);
-        while (!q.empty()) {
-            auto& t = q.front();
-            q.pop_front_nonatomic();
-            irq_save_lock_type irq_lock;
-            WITH_LOCK(irq_lock) {
+        irq_save_lock_type irq_lock;
+        WITH_LOCK(irq_lock) {
+            auto& q = incoming_wakeups[i];
+            while (!q.empty()) {
+                auto& t = q.front();
+                q.pop_front();
                 if (&t == thread::current()) {
                     // Special case of current thread being woken before
                     // having a chance to be scheduled out.
@@ -446,7 +420,7 @@ void cpu::load_balance()
         }
         WITH_LOCK(irq_lock) {
             auto i = std::find_if(runqueue.rbegin(), runqueue.rend(),
-                    [](thread& t) { return !t._attr._pinned_cpu && t._migration_lock_counter == 0; });
+                    [](thread& t) { return t._migration_lock_counter == 0; });
             if (i == runqueue.rend()) {
                 continue;
             }
@@ -463,7 +437,7 @@ void cpu::load_balance()
             mig._runtime.export_runtime();
             mig.remote_thread_local_var(::percpu_base) = min->percpu_base;
             mig.remote_thread_local_var(current_cpu) = min;
-            min->incoming_wakeups[id].push_front(mig);
+            min->incoming_wakeups[id].push_back(mig);
             min->incoming_wakeups_mask.set(id);
             // FIXME: avoid if the cpu is alive and if the priority does not
             // FIXME: warrant an interruption
@@ -515,7 +489,7 @@ void thread::yield()
     t->_runtime.set_local(tnext._runtime);
     // Note that reschedule_from_interrupt will further increase t->_runtime
     // by thyst, giving the other thread 2*thyst to run before going back to t
-    t->_detached_state->_cpu->reschedule_from_interrupt(false);
+    t->_detached_state->_cpu->reschedule_from_interrupt();
 }
 
 void thread::set_priority(float priority)
@@ -553,6 +527,27 @@ std::unordered_map<unsigned long, thread *> thread_map
     __attribute__((init_priority((int)init_prio::threadlist)));
 
 static thread_runtime::duration total_app_time_exited(0);
+
+thread_runtime::duration thread::thread_clock() {
+    if (this == current()) {
+        WITH_LOCK (preempt_lock) {
+            // Inside preempt_lock, we are running and the scheduler can't
+            // intervene and change _total_cpu_time or _running_since
+            return _total_cpu_time +
+                    (osv::clock::uptime::now() - tcpu()->running_since);
+        }
+    } else {
+        // _total_cpu_time is the accurate answer, *unless* the thread is
+        // currently running on a different CPU. If it is running on a
+        // different CPU, correcting for the partial time slice is very tricky
+        // (and probably will require some additional memory ordering) so we
+        // will leave this as a TODO.
+        // FIXME: we assume reads/writes to _total_cpu_time are atomic.
+        // They are, but we should use std::atomic to guarantee that.
+        return _total_cpu_time;
+    }
+}
+
 
 std::chrono::nanoseconds osv_run_stats()
 {
@@ -640,6 +635,10 @@ thread::thread(std::function<void ()> func, attr attr, bool main)
 
     if (_attr._detached) {
         _detach_state.store(detach_state::detached);
+    }
+
+    if (_attr._pinned_cpu) {
+        ++_migration_lock_counter;
     }
 
     if (main) {
@@ -762,7 +761,10 @@ void thread::wake_impl(detached_state* st, unsigned allowed_initial_states_mask)
         unsigned c = cpu::current()->id;
         // we can now use st->t here, since the thread cannot terminate while
         // it's waking, but not afterwards, when it may be running
-        tcpu->incoming_wakeups[c].push_front(*st->t);
+        irq_save_lock_type irq_lock;
+        WITH_LOCK(irq_lock) {
+            tcpu->incoming_wakeups[c].push_back(*st->t);
+        }
         if (!tcpu->incoming_wakeups_mask.test_all_and_set(c)) {
             // FIXME: avoid if the cpu is alive and if the priority does not
             // FIXME: warrant an interruption
@@ -811,11 +813,6 @@ void thread::wake_lock(mutex* mtx, wait_record* wr)
 void thread::main()
 {
     _func();
-}
-
-thread* thread::current()
-{
-    return sched::s_current;
 }
 
 void thread::wait()
@@ -991,39 +988,6 @@ void thread_handle::wake()
     }
 }
 
-void preempt_disable()
-{
-    ++preempt_counter;
-}
-
-void preempt_enable()
-{
-    --preempt_counter;
-    if (preemptable() && need_reschedule && arch::irq_enabled()) {
-        cpu::schedule();
-    }
-}
-
-bool preemptable()
-{
-    return (!preempt_counter);
-}
-
-unsigned int get_preempt_counter()
-{
-    return preempt_counter;
-}
-
-void preempt()
-{
-    if (preemptable()) {
-        sched::cpu::current()->reschedule_from_interrupt(true);
-    } else {
-        // preempt_enable() will pick this up eventually
-        need_reschedule = true;
-    }
-}
-
 timer_list::callback_dispatch::callback_dispatch()
 {
     clock_event->set_callback(this);
@@ -1033,12 +997,11 @@ void timer_list::fired()
 {
     auto now = osv::clock::uptime::now();
     _last = osv::clock::uptime::time_point::max();
-    // don't hold iterators across list iteration, since the list can change
-    while (!_list.empty() && _list.begin()->_time <= now) {
-        auto j = _list.begin();
-        assert(j->_state == timer_base::state::armed);
-        _list.erase(j);
-        j->expire();
+    _list.expire(now);
+    timer_base* timer;
+    while ((timer = _list.pop_expired())) {
+        assert(timer->_state == timer_base::state::armed);
+        timer->expire();
     }
     if (!_list.empty()) {
         rearm();
@@ -1047,7 +1010,7 @@ void timer_list::fired()
 
 void timer_list::rearm()
 {
-    auto t = _list.begin()->_time;
+    auto t = _list.get_next_timeout();
     if (t < _last) {
         _last = t;
         clock_event->set(t);
@@ -1055,25 +1018,24 @@ void timer_list::rearm()
 }
 
 // call with irq disabled
-void timer_list::suspend(bi::list<timer_base>& timers)
+void timer_list::suspend(timer_base::client_list_t& timers)
 {
     for (auto& t : timers) {
         assert(t._state == timer::state::armed);
-        _list.erase(_list.iterator_to(t));
+        _list.remove(t);
     }
 }
 
 // call with irq disabled
-void timer_list::resume(bi::list<timer_base>& timers)
+void timer_list::resume(timer_base::client_list_t& timers)
 {
-    bool rearm = false;
+    bool do_rearm = false;
     for (auto& t : timers) {
         assert(t._state == timer::state::armed);
-        auto i = _list.insert(t).first;
-        rearm |= i == _list.begin();
+        do_rearm |= _list.insert(t);
     }
-    if (rearm) {
-        clock_event->set(_list.begin()->_time);
+    if (do_rearm) {
+        rearm();
     }
 }
 
@@ -1111,9 +1073,8 @@ void timer_base::set(osv::clock::uptime::time_point time)
         _time = time;
 
         auto& timers = cpu::current()->timers;
-        timers._list.insert(*this);
         _t._active_timers.push_back(*this);
-        if (timers._list.iterator_to(*this) == timers._list.begin()) {
+        if (timers._list.insert(*this)) {
             timers.rearm();
         }
     }
@@ -1129,7 +1090,7 @@ void timer_base::cancel()
     WITH_LOCK(irq_lock) {
         if (_state == state::armed) {
             _t._active_timers.erase(_t._active_timers.iterator_to(*this));
-            cpu::current()->timers._list.erase(cpu::current()->timers._list.iterator_to(*this));
+            cpu::current()->timers._list.remove(*this);
         }
         _state = state::free;
     }
@@ -1146,7 +1107,7 @@ void timer_base::reset(osv::clock::uptime::time_point time)
     irq_save_lock_type irq_lock;
     WITH_LOCK(irq_lock) {
         if (_state == state::armed) {
-            timers._list.erase(timers._list.iterator_to(*this));
+            timers._list.remove(*this);
         } else {
             _t._active_timers.push_back(*this);
             _state = state::armed;
@@ -1154,9 +1115,7 @@ void timer_base::reset(osv::clock::uptime::time_point time)
 
         _time = time;
 
-        timers._list.insert(*this);
-
-        if (timers._list.iterator_to(*this) == timers._list.begin()) {
+        if (timers._list.insert(*this)) {
             timers.rearm();
         }
     }

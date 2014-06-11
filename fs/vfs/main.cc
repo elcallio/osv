@@ -62,6 +62,7 @@
 #include "vfs.h"
 
 #include "libc/internal/libc.h"
+#include "libc/dirent/dirent.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -70,6 +71,8 @@
 
 #include "fs/fs.hh"
 #include "libc/libc.hh"
+
+#include <mntent.h>
 
 using namespace std;
 
@@ -352,6 +355,8 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
     return -1;
 }
 
+LFS64(preadv);
+
 ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
 {
     return preadv(fd, iov, iovcnt, -1);
@@ -385,6 +390,7 @@ ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
     errno = error;
     return -1;
 }
+LFS64(pwritev);
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
 {
@@ -525,10 +531,6 @@ extern "C" int flock(int fd, int operation)
 TRACEPOINT(trace_vfs_readdir, "%d %p", int, dirent*);
 TRACEPOINT(trace_vfs_readdir_ret, "");
 TRACEPOINT(trace_vfs_readdir_err, "%d", int);
-
-struct __DIR_s {
-    int fd;
-};
 
 DIR *opendir(const char *path)
 {
@@ -1374,23 +1376,23 @@ int isatty(int fd)
 {
     struct file *fp;
     int istty = 0;
-    int error;
 
     trace_vfs_isatty(fd);
-    error = fget(fd, &fp);
-    if (error)
-        goto out_errno;
+    fileref f(fileref_from_fd(fd));
+    if (!f) {
+        errno = EBADF;
+        trace_vfs_isatty_err(errno);
+        return -1;
+    }
 
-    if (fp->f_dentry && fp->f_dentry->d_vnode->v_flags & VISTTY)
+    fp = f.get();
+    if (dynamic_cast<tty_file*>(fp) ||
+        (fp->f_dentry && fp->f_dentry->d_vnode->v_flags & VISTTY)) {
         istty = 1;
-    fdrop(fp);
+    }
 
     trace_vfs_isatty_ret(istty);
     return istty;
-    out_errno:
-    errno = error;
-    trace_vfs_isatty_err(error);
-    return -1;
 }
 
 TRACEPOINT(trace_vfs_truncate, "\"%s\" 0x%x", const char*, off_t);
@@ -1479,9 +1481,85 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsize)
     return -1;
 }
 
+TRACEPOINT(trace_vfs_fallocate, "%d %d 0x%x 0x%x", int, int, loff_t, loff_t);
+TRACEPOINT(trace_vfs_fallocate_ret, "");
+TRACEPOINT(trace_vfs_fallocate_err, "%d", int);
+
+int fallocate(int fd, int mode, loff_t offset, loff_t len)
+{
+    struct file *fp;
+    int error;
+
+    trace_vfs_fallocate(fd, mode, offset, len);
+    error = fget(fd, &fp);
+    if (error)
+        goto out_errno;
+
+    error = sys_fallocate(fp, mode, offset, len);
+    fdrop(fp);
+
+    if (error)
+        goto out_errno;
+    trace_vfs_fallocate_ret();
+    return 0;
+
+    out_errno:
+    trace_vfs_fallocate_err(error);
+    errno = error;
+    return -1;
+}
+
+LFS64(fallocate);
+
 TRACEPOINT(trace_vfs_utimes, "\"%s\"", const char*);
 TRACEPOINT(trace_vfs_utimes_ret, "");
 TRACEPOINT(trace_vfs_utimes_err, "%d", int);
+
+extern "C"
+int futimesat(int dirfd, const char *pathname, const struct timeval times[2])
+{
+    struct stat st;
+    struct file *fp;
+    char *absolute_path;
+    int length;
+    int error;
+
+    if ((pathname && pathname[0] == '/') || dirfd == AT_FDCWD)
+        return utimes(pathname, times);
+
+    error = fstat(dirfd, &st);
+    if (error) {
+        error = errno;
+        goto out_errno;
+    }
+
+    if (!S_ISDIR(st.st_mode)){
+        error = ENOTDIR;
+        goto out_errno;
+    }
+
+    error = fget(dirfd, &fp);
+    if (error)
+        goto out_errno;
+
+    length = strlen(fp->f_dentry->d_path) + strlen(pathname) + 2;
+    absolute_path = (char*)malloc(length);
+    if (pathname)
+        snprintf(absolute_path, length, "%s/%s", fp->f_dentry->d_path, pathname);
+    else
+        strcpy(absolute_path, fp->f_dentry->d_path);
+    error = utimes(absolute_path, times);
+    free(absolute_path);
+    fdrop(fp);
+
+    if (error)
+        goto out_errno;
+    return 0;
+
+    out_errno:
+    errno = error;
+    return -1;
+}
 
 extern "C"
 int utimes(const char *pathname, const struct timeval times[2])
@@ -1554,7 +1632,14 @@ fs_noop(void)
     return 0;
 }
 
-#ifdef DEBUG_VFS
+int chroot(const char *path)
+{
+    WARN_STUBBED();
+    errno = ENOSYS;
+    return -1;
+}
+
+#ifdef NOTYET
 /*
  * Dump internal data.
  */
@@ -1674,13 +1759,28 @@ extern "C" void mount_zfs_rootfs(void)
     if (ret)
         kprintf("failed to pivot root, error = %s\n", strerror(ret));
 
-    ret = sys_mount("", "/dev", "devfs", 0, NULL);
-    if (ret)
-        kprintf("failed to mount devfs, error = %s\n", strerror(ret));
+    auto ent = setmntent("/etc/fstab", "r");
+    if (!ent) {
+        return;
+    }
 
-    ret = sys_mount("", "/proc", "procfs", 0, NULL);
-    if (ret)
-        kprintf("failed to mount procfs, error = %s\n", strerror(ret));
+    struct mntent *m = nullptr;
+    while ((m = getmntent(ent)) != nullptr) {
+        if (!strcmp(m->mnt_dir, "/")) {
+            continue;
+        }
+
+        if ((m->mnt_opts != nullptr) && strcmp(m->mnt_opts, MNTOPT_DEFAULTS)) {
+            printf("Warning: opts %s, ignored for fs %s\n", m->mnt_opts, m->mnt_type);
+        }
+
+        // FIXME: Right now, ignoring mntops. In the future we may have an option parser
+        ret = sys_mount(m->mnt_fsname, m->mnt_dir, m->mnt_type, 0, NULL);
+        if (ret) {
+            printf("failed to mount %s, error = %s\n", m->mnt_type, strerror(ret));
+        }
+    } while (m != nullptr);
+    endmntent(ent);
 }
 
 extern "C" void unmount_rootfs(void)

@@ -5,13 +5,11 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <math.h>
-#include <osv/types.h>
+#ifndef DUMP_HH
+#define DUMP_HH
 
-extern "C"
-int __isnan(double v)
-{
-    u64 r;
-    asm("cmpunordsd %1, %1; movq %1, %0" : "=rm"(r), "+x"(v));
-    return r & 1;
-}
+struct exception_frame;
+
+void dump_registers(exception_frame* ef);
+
+#endif /* DUMP_HH */
