@@ -92,6 +92,8 @@ libc/%.o: source-dialects =
 
 kernel-defines = -D_KERNEL $(source-dialects)
 
+gcc-sysroot = $(if $(CROSS_PREFIX), --sysroot $(src)/external/$(arch)/gcc.bin) \
+
 # This play the same role as "_KERNEL", but _KERNEL unfortunately is too
 # overloaded. A lot of files will expect it to be set no matter what, specially
 # in headers. "userspace" inclusion of such headers is valid, and lacking
@@ -112,7 +114,7 @@ COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -
 	-fno-omit-frame-pointer $(compiler-specific) \
 	-include $(src)/compiler/include/intrinsics.hh \
 	$(do-sys-includes) \
-	$(arch-cflags) $(conf-opt) $(acpi-defines) $(tracing-flags) \
+	$(arch-cflags) $(conf-opt) $(acpi-defines) $(tracing-flags) $(gcc-sysroot) \
 	$(configuration) -nostdinc -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207" $(EXTRA_FLAGS)
 
 tracing-flags-0 =
@@ -303,6 +305,7 @@ tests += tests/tst-truncate.so
 tests += $(boost-tests)
 tests += tests/misc-panic.so
 tests += tests/tst-utimes.so
+tests += tests/tst-utimensat.so
 tests += tests/tst-futimesat.so
 tests += tests/misc-tcp.so
 tests += tests/tst-strerror_r.so
@@ -751,7 +754,7 @@ ifeq ($(arch),x64)
 drivers += $(libtsm)
 drivers += drivers/vga.o drivers/kbd.o drivers/isa-serial.o
 drivers += core/interrupt.o
-drivers += core/pvclock-abi.o
+drivers += arch/$(arch)/pvclock-abi.o
 drivers += drivers/device.o
 drivers += drivers/pci-device.o drivers/pci-function.o drivers/pci-bridge.o
 drivers += drivers/driver.o
@@ -886,16 +889,20 @@ else
     libgcc_eh.a := $(shell find $(gccbase)/ -name libgcc_eh.a |  grep -v /32/)
 endif
 
-boost-lib-dir := $(shell dirname `find $(miscbase)/ -name libboost_system-mt.a`)
+boost-lib-dir := $(firstword $(dir $(shell find $(miscbase)/ -name libboost_system*.a)))
 
-boost-libs := $(boost-lib-dir)/libboost_program_options-mt.a \
-              $(boost-lib-dir)/libboost_system-mt.a
+# link with -mt if present, else the base version (and hope it is multithreaded)
 
-$(boost-tests): $(boost-lib-dir)/libboost_unit_test_framework-mt.so \
-                $(boost-lib-dir)/libboost_filesystem-mt.so
+boost-mt := $(if $(filter %-mt.a, $(wildcard $(boost-lib-dir)/*.a)),-mt)
+
+boost-libs := $(boost-lib-dir)/libboost_program_options$(boost-mt).a \
+              $(boost-lib-dir)/libboost_system$(boost-mt).a
+
+$(boost-tests): $(boost-lib-dir)/libboost_unit_test_framework$(boost-mt).so \
+                $(boost-lib-dir)/libboost_filesystem$(boost-mt).so
 
 dummy-shlib.so: dummy-shlib.o
-	$(call quiet, $(CXX) -nodefaultlibs -shared -o $@ $^, LD $@)
+	$(call quiet, $(CXX) -nodefaultlibs -shared $(gcc-sysroot) -o $@ $^, LD $@)
 
 loader.elf: arch/$(arch)/boot.o arch/$(arch)/loader.ld loader.o runtime.o $(drivers) \
 	$(objects) dummy-shlib.so bootfs.bin

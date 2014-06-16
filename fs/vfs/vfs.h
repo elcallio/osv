@@ -117,6 +117,9 @@ int	 sys_statfs(char *path, struct statfs *buf);
 int	 sys_truncate(char *path, off_t length);
 ssize_t	 sys_readlink(char *path, char *buf, size_t bufsize);
 int  sys_utimes(char *path, const struct timeval times[2]);
+int  sys_utimensat(int dirfd, const char *pathname,
+                   const struct timespec times[2], int flags);
+int  sys_futimens(int fd, const struct timespec times[2]);
 int  sys_fallocate(struct file *fp, int mode, loff_t offset, loff_t len);
 
 int	 sys_mount(char *dev, char *dir, char *fsname, int flags, void *data);
@@ -132,12 +135,12 @@ int	 task_conv(struct task *t, const char *path, int mode, char *full);
 //int	 sec_file_permission(task_t task, char *path, int mode);
 int	 sec_vnode_permission(char *path);
 
-int	 namei(char *path, struct dentry **dpp);
+int     namei(const char *path, struct dentry **dpp);
 int	 lookup(char *path, struct dentry **dpp, char **name);
 void	 vnode_init(void);
 void	 lookup_init(void);
 
-int	 vfs_findroot(char *path, struct mount **mp, char **root);
+int     vfs_findroot(const char *path, struct mount **mp, char **root);
 int	 vfs_dname_copy(char *dest, const char *src, size_t size);
 
 int	 fs_noop(void);

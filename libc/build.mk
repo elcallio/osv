@@ -389,6 +389,7 @@ libc += process/execve.o
 libc += process/execle.o
 libc += process/execv.o
 libc += process/execl.o
+libc += process/waitpid.o
 
 libc += arch/$(arch)/setjmp/setjmp.o
 libc += arch/$(arch)/setjmp/longjmp.o
@@ -645,6 +646,12 @@ libc += time/wcsftime.o
 libc += unistd/sleep.o
 libc += unistd/gethostname.o
 libc += unistd/sync.o
+libc += unistd/getpgid.o
+libc += unistd/setpgid.o
+libc += unistd/getpgrp.o
+libc += unistd/getppid.o
+libc += unistd/getsid.o
+libc += unistd/setsid.o
 
 libc += pthread.o
 libc += libc.o
