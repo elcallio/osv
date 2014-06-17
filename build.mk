@@ -336,6 +336,7 @@ tests += tests/misc-printf.so
 tests += tests/libstatic-thread-variable.so tests/tst-static-thread-variable.so
 tests/tst-static-thread-variable.so: tests/libstatic-thread-variable.so
 tests/tst-static-thread-variable.so: COMMON += -L./tests -lstatic-thread-variable
+tests += tests/misc-lock-perf.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -741,6 +742,7 @@ drivers += drivers/console-multiplexer.o
 drivers += drivers/console-driver.o
 drivers += drivers/line-discipline.o
 drivers += drivers/clock.o
+drivers += drivers/clock-common.o
 drivers += drivers/clockevent.o
 drivers += drivers/ramdisk.o
 drivers += core/elf.o
