@@ -893,6 +893,35 @@ int link(const char *oldpath, const char *newpath)
     return -1;
 }
 
+
+TRACEPOINT(trace_vfs_symlink, "oldpath=%s, newpath=%s", const char*, const char*);
+TRACEPOINT(trace_vfs_symlink_ret, "");
+TRACEPOINT(trace_vfs_symlink_err, "errno=%d", int);
+
+int symlink(const char *oldpath, const char *newpath)
+{
+    int error;
+
+    trace_vfs_symlink(oldpath, newpath);
+
+    error = ENOENT;
+    if (oldpath == NULL || newpath == NULL) {
+        errno = ENOENT;
+        trace_vfs_symlink_err(error);
+        return (-1);
+    }
+
+    error = sys_symlink(oldpath, newpath);
+    if (error) {
+        errno = error;
+        trace_vfs_symlink_err(error);
+        return (-1);
+    }
+
+    trace_vfs_symlink_ret();
+    return 0;
+}
+
 TRACEPOINT(trace_vfs_unlink, "\"%s\"", const char*);
 TRACEPOINT(trace_vfs_unlink_ret, "");
 TRACEPOINT(trace_vfs_unlink_err, "%d", int);
@@ -959,10 +988,34 @@ int stat(const char *pathname, struct stat *st)
 
 LFS64(stat);
 
+TRACEPOINT(trace_vfs_lstat, "pathname=%s, stat=%p", const char*, struct stat*);
+TRACEPOINT(trace_vfs_lstat_ret, "");
+TRACEPOINT(trace_vfs_lstat_err, "errno=%d", int);
 extern "C"
 int __lxstat(int ver, const char *pathname, struct stat *st)
 {
-    return __xstat(ver, pathname, st);
+    struct task *t = main_task;
+    char path[PATH_MAX];
+    int error;
+
+    trace_vfs_lstat(pathname, st);
+
+    error = task_conv(t, pathname, 0, path);
+    if (error) {
+        errno = error;
+        trace_vfs_lstat_err(error);
+        return (-1);
+    }
+
+    error = sys_lstat(path, st);
+    if (error) {
+        errno = error;
+        trace_vfs_lstat_err(error);
+        return (-1);
+    }
+
+    trace_vfs_lstat_ret();
+    return 0;
 }
 
 LFS64(__lxstat);
@@ -1320,6 +1373,12 @@ int access(const char *pathname, int mode)
     return -1;
 }
 
+extern "C" 
+int eaccess(const char *pathname, int mode)
+{
+    return access(pathname, mode);
+}
+
 #if 0
 static int
 fs_pipe(struct task *t, struct msg *msg)
@@ -1460,6 +1519,7 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsize)
     struct task *t = main_task;
     char path[PATH_MAX];
     int error;
+    ssize_t size;
 
     error = -EINVAL;
     if (bufsize <= 0)
@@ -1472,10 +1532,13 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsize)
     if (error)
         goto out_errno;
 
-    error = sys_readlink(path, buf, bufsize);
-    if (error)
+    size  = 0;
+    error = sys_readlink(path, buf, bufsize, &size);
+
+    if (error != 0)
         goto out_errno;
-    return 0;
+
+    return size;
     out_errno:
     errno = error;
     return -1;
@@ -1843,6 +1906,7 @@ extern "C" void unmount_rootfs(void)
 }
 
 extern "C" void bio_init(void);
+extern "C" void bio_sync(void);
 
 int vfs_initialized;
 
@@ -1887,6 +1951,8 @@ void vfs_exit(void)
     replace_cwd(main_task, nullptr, []() { return 0; });
     /* Unmount all file systems */
     unmount_rootfs();
+    /* Finish with the bio layer */
+    bio_sync();
 }
 
 void sys_panic(const char *str)

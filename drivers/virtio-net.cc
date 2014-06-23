@@ -273,18 +273,6 @@ net::net(pci::device& dev)
 
     _ifn->if_capenable = _ifn->if_capabilities | IFCAP_HWSTATS;
 
-    //
-    // Enable indirect descriptors utilization.
-    //
-    // TODO:
-    // Optimize the indirect descriptors infrastructure:
-    //  - Preallocate a ring of indirect descriptors per vqueue.
-    //  - Consume/recycle from this pool while u can.
-    //  - If there is no more free descriptors in the pool above - allocate like
-    //    we do today.
-    //
-    _txq.vqueue->set_use_indirect(true);
-
     //Start the polling thread before attaching it to the Rx interrupt
     poll_task->start();
 
@@ -616,7 +604,7 @@ inline int net::txq::xmit_prep(mbuf* m_head, void*& cooky)
 int net::txq::try_xmit_one_locked(net_req* req)
 {
     mbuf *m_head = req->mb, *m;
-    u16 vec_sz = 1;
+    u16 vec_sz;
     u64 tx_bytes = 0;
 
     if (_parent->_mergeable_bufs) {
@@ -632,13 +620,13 @@ int net::txq::try_xmit_one_locked(net_req* req)
 
         if (frag_len != 0) {
             net_d("Frag len=%d:", frag_len);
-            vec_sz++;
             tx_bytes += frag_len;
             vqueue->add_out_sg(m->m_hdr.mh_data, m->m_hdr.mh_len);
         }
     }
 
     req->tx_bytes = tx_bytes;
+    vec_sz = vqueue->_sg_vec.size();
 
     if (!vqueue->avail_ring_has_room(vec_sz)) {
         if (vqueue->used_ring_not_empty()) {

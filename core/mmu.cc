@@ -1085,8 +1085,6 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
     return total;
 }
 
-//TRACEPOINT(trace_clear_pte, "ptep=%p, cow=%d, pte=%x", void*, bool, uint64_t);
-
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
 {
     bool search = !(flags & mmap_fixed);
@@ -1115,14 +1113,14 @@ void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
               fileref f, f_offset offset)
 {
     bool search = !(flags & mmu::mmap_fixed);
-    auto asize = align_up(size, mmu::page_size);
+    size = align_up(size, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto *vma = f->mmap(addr_range(start, start + size), flags, perm, offset).release();
     void *v;
     WITH_LOCK(vma_list_mutex) {
-        v = (void*) allocate(vma, start, asize, search);
+        v = (void*) allocate(vma, start, size, search);
         if (flags & mmap_populate) {
-            populate_vma(vma, v, asize);
+            populate_vma(vma, v, std::min(size, align_up(::size(f), page_size)));
         }
     }
     return v;
@@ -1184,7 +1182,7 @@ TRACEPOINT(trace_mmu_vm_fault, "addr=%p, error_code=%x", uintptr_t, unsigned int
 TRACEPOINT(trace_mmu_vm_fault_sigsegv, "addr=%p, error_code=%x, %s", uintptr_t, unsigned int, const char*);
 TRACEPOINT(trace_mmu_vm_fault_ret, "addr=%p, error_code=%x", uintptr_t, unsigned int);
 
-void vm_sigsegv(uintptr_t addr, exception_frame* ef)
+static void vm_sigsegv(uintptr_t addr, exception_frame* ef)
 {
     void *pc = ef->get_pc();
     if (pc >= text_start && pc < text_end) {
@@ -1192,7 +1190,12 @@ void vm_sigsegv(uintptr_t addr, exception_frame* ef)
         dump_registers(ef);
         abort();
     }
-    osv::handle_segmentation_fault(addr, ef);
+    osv::handle_mmap_fault(addr, SIGSEGV, ef);
+}
+
+static void vm_sigbus(uintptr_t addr, exception_frame* ef)
+{
+    osv::handle_mmap_fault(addr, SIGBUS, ef);
 }
 
 void vm_fault(uintptr_t addr, exception_frame* ef)
@@ -1552,6 +1555,27 @@ file_vma::file_vma(addr_range range, unsigned perm, unsigned flags, fileref file
     if (err != 0) {
         throw make_error(err);
     }
+}
+
+void file_vma::fault(uintptr_t addr, exception_frame *ef)
+{
+    auto hp_start = align_up(_range.start(), huge_page_size);
+    auto hp_end = align_down(_range.end(), huge_page_size);
+    auto fsize = ::size(_file);
+    if (offset(addr) >= fsize) {
+        vm_sigbus(addr, ef);
+        return;
+    }
+    size_t size;
+    if (!has_flags(mmap_small) && (hp_start <= addr && addr < hp_end) && offset(hp_end) < fsize) {
+        addr = align_down(addr, huge_page_size);
+        size = huge_page_size;
+    } else {
+        size = page_size;
+    }
+
+    populate_vma<account_opt::no>(this, (void*)addr, size,
+            mmu::is_page_fault_write(ef->get_error()));
 }
 
 file_vma::~file_vma()

@@ -20,7 +20,8 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright 2014 Nexenta Systems, Inc.  All rights reserved.
  */
 
 /* Portions Copyright 2007 Jeremy Teo */
@@ -205,7 +206,6 @@ zfs_close(vnode_t *vp, file_t *fp)
 	return (0);
 }
 
-#ifdef NOTYET
 /*
  * Lseek support for finding holes (cmd == _FIO_SEEK_HOLE) and
  * data (cmd == _FIO_SEEK_DATA). "off" is an in/out parameter.
@@ -249,6 +249,59 @@ zfs_holey(vnode_t *vp, u_long cmd, offset_t *off)
 	return (error);
 }
 
+/* ARGSUSED */
+static int
+zfs_ioctl(vnode_t *vp, file_t *fp, u_long com, void *data)
+{
+	offset_t off;
+	int error;
+	zfsvfs_t *zfsvfs;
+	znode_t *zp;
+	int flag = 0;
+	cred_t *cr = CRED();
+
+	switch (com) {
+	case _FIOFFS:
+		return (0);
+
+		/*
+		 * The following two ioctls are used by bfu.  Faking out,
+		 * necessary to avoid bfu errors.
+		 */
+	case _FIOGDIO:
+	case _FIOSDIO:
+		return (0);
+
+	case _FIO_SEEK_DATA:
+	case _FIO_SEEK_HOLE:
+#ifdef sun
+		if (ddi_copyin((void *)data, &off, sizeof (off), flag))
+			return (SET_ERROR(EFAULT));
+#else
+		off = *(offset_t *)data;
+#endif
+		zp = VTOZ(vp);
+		zfsvfs = zp->z_zfsvfs;
+		ZFS_ENTER(zfsvfs);
+		ZFS_VERIFY_ZP(zp);
+
+		/* offset parameter is in/out */
+		error = zfs_holey(vp, com, &off);
+		ZFS_EXIT(zfsvfs);
+		if (error)
+			return (error);
+#ifdef sun
+		if (ddi_copyout(&off, (void *)data, sizeof (off), flag))
+			return (SET_ERROR(EFAULT));
+#else
+		*(offset_t *)data = off;
+#endif
+		return (0);
+	}
+	return (ENOTTY);
+}
+
+#ifdef NOTYET
 static vm_page_t
 page_lookup(vnode_t *vp, int64_t start, int64_t off, int64_t nbytes)
 {
@@ -906,7 +959,7 @@ again:
 		nbytes = MIN(n, max_blksz - P2PHASE(woff, max_blksz));
 
 		if (woff + nbytes > zp->z_size)
-			vp->v_size = woff + nbytes;
+			vnode_pager_setsize(vp, woff + nbytes);
 
 		if (abuf == NULL) {
 			tx_bytes = uio->uio_resid;
@@ -3211,7 +3264,6 @@ out:
 	return (error);
 }
 
-#ifdef NOTYET
 /*
  * Insert the indicated symbolic reference entry into the directory.
  *
@@ -3231,8 +3283,7 @@ out:
  */
 /*ARGSUSED*/
 static int
-zfs_symlink(vnode_t *dvp, vnode_t **vpp, char *name, vattr_t *vap, char *link,
-    cred_t *cr, kthread_t *td)
+zfs_symlink(vnode_t *dvp, char *name, char *link)
 {
 	znode_t		*zp, *dzp = VTOZ(dvp);
 	zfs_dirlock_t	*dl;
@@ -3244,8 +3295,16 @@ zfs_symlink(vnode_t *dvp, vnode_t **vpp, char *name, vattr_t *vap, char *link,
 	int		zflg = ZNEW;
 	zfs_acl_ids_t	acl_ids;
 	boolean_t	fuid_dirtied;
+	cred_t		*cr = CRED();
 	uint64_t	txtype = TX_SYMLINK;
-	int		flags = 0;
+	vattr_t		va = {
+		.va_mask	= AT_TYPE|AT_MODE,
+		.va_type	= VLNK,
+		.va_size	= len,
+
+		/* symlink permissions are irrelevant */
+		.va_mode	= S_IRWXU|S_IRWXG|S_IRWXO,
+	}, *vap = &va;
 
 	ASSERT(vap->va_type == VLNK);
 
@@ -3258,8 +3317,6 @@ zfs_symlink(vnode_t *dvp, vnode_t **vpp, char *name, vattr_t *vap, char *link,
 		ZFS_EXIT(zfsvfs);
 		return (EILSEQ);
 	}
-	if (flags & FIGNORECASE)
-		zflg |= ZCILOOK;
 
 	if (len > MAXPATHLEN) {
 		ZFS_EXIT(zfsvfs);
@@ -3347,10 +3404,7 @@ top:
 	 */
 	(void) zfs_link_create(dl, zp, tx, ZNEW);
 
-	if (flags & FIGNORECASE)
-		txtype |= TX_CI;
 	zfs_log_symlink(zilog, tx, txtype, dzp, zp, name, link);
-	*vpp = ZTOV(zp);
 
 	zfs_acl_ids_free(&acl_ids);
 
@@ -3384,7 +3438,7 @@ top:
  */
 /* ARGSUSED */
 static int
-zfs_readlink(vnode_t *vp, uio_t *uio, cred_t *cr, caller_context_t *ct)
+zfs_readlink(vnode_t *vp, uio_t *uio)
 {
 	znode_t		*zp = VTOZ(vp);
 	zfsvfs_t	*zfsvfs = zp->z_zfsvfs;
@@ -3406,7 +3460,6 @@ zfs_readlink(vnode_t *vp, uio_t *uio, cred_t *cr, caller_context_t *ct)
 	ZFS_EXIT(zfsvfs);
 	return (error);
 }
-#endif /* NOTYET */
 
 /*
  * Insert a new entry into directory tdvp referencing svp.
@@ -5025,7 +5078,7 @@ struct vnops zfs_vnops = {
 	zfs_read,			/* read */
 	zfs_write,			/* write */
 	zfs_seek,			/* seek */
-	(vnop_ioctl_t)vop_einval,	/* ioctl */
+	zfs_ioctl,			/* ioctl */
 	zfs_fsync,			/* fsync */
 	zfs_readdir,			/* readdir */
 	zfs_lookup,			/* lookup */
@@ -5041,4 +5094,6 @@ struct vnops zfs_vnops = {
 	zfs_link,			/* link */
 	zfs_arc,			/* arc */
 	zfs_fallocate,			/* fallocate */
+	zfs_readlink,			/* read link */
+	zfs_symlink,			/* symbolic link */
 };

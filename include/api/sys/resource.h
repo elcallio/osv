@@ -44,8 +44,6 @@ struct rusage
 	long	ru_nsignals;
 	long	ru_nvcsw;
 	long	ru_nivcsw;
-	/* room for more... */
-	long    __reserved[16];
 };
 
 int getrlimit (int, struct rlimit *);
@@ -64,8 +62,9 @@ int prlimit(pid_t, int, const struct rlimit *, struct rlimit *);
 #define PRIO_PGRP    1
 #define PRIO_USER    2
 
-#define RUSAGE_SELF     0
-#define RUSAGE_CHILDREN 1
+#define RUSAGE_SELF      0
+#define RUSAGE_CHILDREN -1
+#define RUSAGE_THREAD    1
 
 #define RLIM_INFINITY (~0ULL)
 #define RLIM_SAVED_CUR RLIM_INFINITY
