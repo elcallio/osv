@@ -88,9 +88,9 @@ extern const struct vfssw vfssw[];
 
 __BEGIN_DECLS
 int	 sys_open(char *path, int flags, mode_t mode, struct file **fp);
-int	 sys_read(struct file *fp, struct iovec *iov, size_t niov,
+int	 sys_read(struct file *fp, const struct iovec *iov, size_t niov,
 		off_t offset, size_t *count);
-int	 sys_write(struct file *fp, struct iovec *iov, size_t niov,
+int	 sys_write(struct file *fp, const struct iovec *iov, size_t niov,
 		off_t offset, size_t *count);
 int	 sys_lseek(struct file *fp, off_t off, int type, off_t * cur_off);
 int	 sys_ioctl(struct file *fp, u_long request, void *buf);
@@ -150,10 +150,12 @@ int	 vfs_dname_copy(char *dest, const char *src, size_t size);
 int	 fs_noop(void);
 
 struct dentry *dentry_alloc(struct dentry *parent_dp, struct vnode *vp, const char *path);
+struct dentry *dentry_lookup(struct mount *mp, char *path);
 void dentry_move(struct dentry *dp, struct dentry *parent_dp, char *path);
 void dentry_remove(struct dentry *dp);
-void	dref(struct dentry *dp);
-void	drele(struct dentry *dp);
+void dref(struct dentry *dp);
+void drele(struct dentry *dp);
+void dentry_init(void);
 
 #ifdef DEBUG_VFS
 void	 vnode_dump(void);

@@ -67,7 +67,7 @@ static int
 random_read(struct device *dev, struct uio *uio, int ioflags)
 {
     int c, error = 0;
-    char *random_buf;
+    char random_buf[PAGE_SIZE];
 
     // Blocking logic
     if (!random_adaptor->seeded) {
@@ -75,8 +75,6 @@ random_read(struct device *dev, struct uio *uio, int ioflags)
     }
 
     if (!error) {
-        random_buf = new char[PAGE_SIZE];
-
         while (uio->uio_resid > 0 && !error) {
             c = std::min(uio->uio_resid, static_cast<long int>(PAGE_SIZE));
             c = (*random_adaptor->read)(static_cast<void *>(random_buf), c);
@@ -86,8 +84,6 @@ random_read(struct device *dev, struct uio *uio, int ioflags)
         // Finished reading; let the source know so it can do some
         // optional housekeeping */
         (*random_adaptor->read)(nullptr, 0);
-
-        delete [] random_buf;
     }
 
     return error;
@@ -130,19 +126,21 @@ struct random_hardware_source rsource = {
     &virtio_rng_read,
 };
 
+// NOTE: This function is not intended to be called directly.
+// Instead, it's registered as a callback into the structure used to register
+// virtio-rng as a hardware source of entropy, so being called whenever needed.
 static int virtio_rng_read(void *buf, int size)
 {
-    if (s_hwrng) {
-        return s_hwrng->get_random_bytes(static_cast<char *>(buf), size);
-    }
-    return 0;
+    return s_hwrng->get_random_bytes(static_cast<char *>(buf), size);
 }
 
 random_device::random_device()
 {
     struct random_device_priv *prv;
 
-    live_entropy_source_register(&rsource);
+    if (s_hwrng) {
+        live_entropy_source_register(&rsource);
+    }
     (random_adaptor->init)();
 
     // Create random
@@ -158,7 +156,9 @@ random_device::random_device()
 
 random_device::~random_device()
 {
-    live_entropy_source_deregister(&rsource);
+    if (s_hwrng) {
+        live_entropy_source_deregister(&rsource);
+    }
     (random_adaptor->deinit)();
 
     device_destroy(_random_dev);

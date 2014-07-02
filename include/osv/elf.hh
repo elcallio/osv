@@ -108,6 +108,12 @@ enum {
     PF_MASKPROC = 0xff000000, // Processor-specific
 };
 
+// Note section
+enum {
+    NT_VERSION = 1,
+};
+
+
 struct Elf64_Phdr {
     Elf64_Word p_type; /* Type of segment */
     Elf64_Word p_flags; /* Segment attributes */
@@ -117,6 +123,14 @@ struct Elf64_Phdr {
     Elf64_Xword p_filesz; /* Size of segment in file */
     Elf64_Xword p_memsz; /* Size of segment in memory */
     Elf64_Xword p_align; /* Alignment of segment */
+};
+
+class Elf64_Note {
+public:
+    explicit Elf64_Note(void *base);
+    std::string n_owner;
+    std::string n_value;
+    Elf64_Word n_type;
 };
 
 enum {
@@ -379,6 +393,8 @@ public:
     symbol_module();
     symbol_module(Elf64_Sym* sym, object* object);
     void* relocated_addr() const;
+    u64 size() const;
+
     Elf64_Sym* symbol;
     object* obj;
 };

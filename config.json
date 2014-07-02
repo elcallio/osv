@@ -8,20 +8,13 @@
             "type": "direct-dir",
             "path": "${OSV_BASE}/mgmt/httpserver"
         },
-        "java": {
+        "osvinit": {
             "type": "direct-dir",
-            "path": "${OSV_BASE}/modules/java/"
+            "path": "${OSV_BASE}/mgmt/osvinit"
         },
-        "java-tests": {
-            "type": "direct-dir",
-            "path": "${OSV_BASE}/modules/java-tests/"
-        },
-        "tests": {
-            "type": "direct-dir",
-            "path": "${OSV_BASE}/modules/tests/"
-        },
-    "include": [
-        "${OSV_BASE}/apps/modules.json"
+    "repositories": [
+        "${OSV_BASE}/apps",
+        "${OSV_BASE}/modules"
     ]
    }
 }

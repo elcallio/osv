@@ -22,6 +22,7 @@
 #include <iterator>
 #include <osv/sched.hh>
 #include <osv/trace.hh>
+#include <osv/version.hh>
 
 #include "arch.hh"
 
@@ -86,6 +87,11 @@ void* symbol_module::relocated_addr() const
     default:
         abort("Unknown relocation type %d\n", symbol_type(*symbol));
     }
+}
+
+u64 symbol_module::size() const
+{
+    return symbol->st_size;
 }
 
 object::object(program& prog, std::string pathname)
@@ -308,8 +314,27 @@ bool file::mlocked()
     return false;
 }
 
+Elf64_Note::Elf64_Note(void *_base)
+{
+    Elf64_Word *base = reinterpret_cast<Elf64_Word *>(_base);
+    char *str = align_up(static_cast<char *>(_base) + 3 * sizeof(*base), 4);
+
+    n_type = base[2];
+
+    n_owner.reserve(base[0]);
+    n_value.reserve(base[1]);
+
+    // The note section strings will include the trailing 0. std::string
+    // doesn't like that very much, and comparisons against a string that is
+    // constructed from this string will fail. Therefore the - 1 at the end
+    n_owner.assign(str, base[0] - 1);
+    str = align_up(str + base[0], 4);
+    n_value.assign(str, base[1] - 1);
+}
+
 void object::load_segments()
 {
+    bool is_executable = false;
     for (unsigned i = 0; i < _ehdr.e_phnum; ++i) {
         auto &phdr = _phdrs[i];
         switch (phdr.p_type) {
@@ -322,7 +347,27 @@ void object::load_segments()
             _dynamic_table = reinterpret_cast<Elf64_Dyn*>(_base + phdr.p_vaddr);
             break;
         case PT_INTERP:
-        case PT_NOTE:
+	    is_executable = true;
+	    break;
+        case PT_NOTE: {
+            struct Elf64_Note header(_base + phdr.p_vaddr);
+
+            if (header.n_type != NT_VERSION) {
+                break;
+            }
+
+            if (header.n_owner != "OSv") {
+                break;
+            }
+
+            // FIXME: In the future, we should probably prevent loading of libosv.so in this
+            // situation.
+            if (header.n_value != osv::version()) {
+                printf("WARNING: libosv.so version mismatch. Kernel is %s, lib is %s\n",
+                        osv::version().c_str(), header.n_value.c_str());
+            }
+            break;
+        }
         case PT_PHDR:
         case PT_GNU_STACK:
         case PT_GNU_RELRO:
@@ -338,6 +383,13 @@ void object::load_segments()
             abort();
             throw std::runtime_error("bad p_type");
         }
+    }
+    // As explained in issue #352, we currently don't correctly support TLS
+    // used in PIEs.
+    if (is_executable && _tls_segment) {
+        std::cout << "WARNING: " << pathname() << " is a PIE using TLS. This "
+                  << "is currently unsupported (see issue #352). Link with "
+                  << "'-shared' instead of '-pie'.\n";
     }
 }
 

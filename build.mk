@@ -19,11 +19,13 @@ endif
 ifndef ARCH
   ARCH = $(host_arch)
 endif
+
+arch = $(ARCH)
+
 $(info build.mk:)
 $(info build.mk: building arch=$(arch), override with ARCH env)
 $(info build.mk: building build_env=$(build_env) gcc_lib_env=$(gcc_lib_env) cxx_lib_env=$(cxx_lib_env))
 $(info build.mk:)
-arch = $(ARCH)
 
 CROSS_PREFIX = $(if $(filter-out $(arch), $(host_arch)), $(arch)-linux-gnu-)
 
@@ -258,6 +260,7 @@ tests += tests/misc-ctxsw.so
 tests += tests/tst-readdir.so
 tests += tests/tst-read.so
 tests += tests/tst-symlink.so
+tests += tests/tst-eventfd.so
 tests += tests/tst-remove.so
 tests += tests/misc-wake.so
 tests += tests/tst-epoll.so
@@ -306,10 +309,12 @@ tests += tests/misc-memcpy.so
 tests += tests/misc-free-perf.so
 tests += tests/tst-fallocate.so
 tests += tests/misc-printf.so
+tests += tests/tst-hostname.so
 tests += tests/libstatic-thread-variable.so tests/tst-static-thread-variable.so
 tests/tst-static-thread-variable.so: tests/libstatic-thread-variable.so
 tests/tst-static-thread-variable.so: COMMON += -L./tests -lstatic-thread-variable
 tests += tests/misc-lock-perf.so
+tests += tests/tst-uio.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -335,6 +340,7 @@ tools := tools/ifconfig/ifconfig.so
 tools += tools/route/lsroute.so
 tools += tools/mkfs/mkfs.so
 tools += tools/cpiod/cpiod.so
+tools += tools/uush/uush.so
 
 ifeq ($(arch),aarch64)
 tools += tests/tst-hello.so
@@ -343,7 +349,7 @@ endif
 
 ifeq ($(arch),x64)
 
-all: loader.img loader.bin usr.img
+all: loader.img loader.bin libosv.so usr.img
 
 boot.bin: arch/x64/boot16.ld arch/x64/boot16.o
 	$(call quiet, $(LD) -o $@ -T $^, LD $@)
@@ -888,6 +894,11 @@ loader.elf: arch/$(arch)/boot.o arch/$(arch)/loader.ld loader.o runtime.o $(driv
 	      $(boost-libs) \
 	    --no-whole-archive, \
 		LD $@)
+
+libosv.so: loader.elf
+	$(call quiet, readelf --dyn-syms loader.elf > osv.syms)
+	$(call quiet, $(src)/scripts/libosv.py osv.syms libosv.ld `$(src)/scripts/osv-version.sh` | $(CC) -c -o osv.o -x assembler -)
+	$(call quiet, $(CC) osv.o -nostdlib -shared -o libosv.so -T libosv.ld, LIBOSV.SO)
 
 bsd/%.o: COMMON += -DSMP -D'__FBSDID(__str__)=extern int __bogus__'
 

@@ -343,7 +343,7 @@ ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
     if (error)
         goto out_errno;
 
-    error = sys_read(fp, (struct iovec *)iov, iovcnt, offset, &bytes);
+    error = sys_read(fp, iov, iovcnt, offset, &bytes);
     fdrop(fp);
 
     if (has_error(error, bytes))
@@ -377,7 +377,7 @@ ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
     if (error)
         goto out_errno;
 
-    error = sys_write(fp, (struct iovec *)iov, iovcnt, offset, &bytes);
+    error = sys_write(fp, iov, iovcnt, offset, &bytes);
     fdrop(fp);
 
     if (has_error(error, bytes))
@@ -1374,10 +1374,12 @@ int access(const char *pathname, int mode)
 }
 
 extern "C" 
-int eaccess(const char *pathname, int mode)
+int euidaccess(const char *pathname, int mode)
 {
     return access(pathname, mode);
 }
+
+weak_alias(euidaccess,eaccess);
 
 #if 0
 static int

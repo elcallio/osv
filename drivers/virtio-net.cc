@@ -142,14 +142,23 @@ inline int net::txq::xmit(mbuf* buff)
 
 inline bool net::txq::kick_hw()
 {
-    return vqueue->kick();
+    bool kicked = vqueue->kick();
+#ifdef DEBUG_VIRTIO_TX
+    stats.tx_kicks += !!kicked;
+#endif
+
+    return kicked;
 }
 
 inline void net::txq::kick_pending(u16 thresh)
 {
     if (_pkts_to_kick >= thresh) {
         _pkts_to_kick = 0;
+#ifdef DEBUG_VIRTIO_TX
+        stats.tx_worker_kicks += !!kick_hw();
+#else
         kick_hw();
+#endif
     }
 }
 
@@ -203,6 +212,18 @@ void net::fill_qstats(const struct txq& txq,
     out_data->ifi_opackets += txq.stats.tx_packets;
     out_data->ifi_obytes   += txq.stats.tx_bytes;
     out_data->ifi_oerrors  += txq.stats.tx_err + txq.stats.tx_drops;
+
+#ifdef DEBUG_VIRTIO_TX
+    printf("packet(%d)/kick(%d) %.2f\n",
+           txq.stats.tx_packets, txq.stats.tx_kicks,
+           double(txq.stats.tx_packets)/txq.stats.tx_kicks);
+    printf("worker packet(%d)/worker_kick(%d) %.2f\n",
+           txq.stats.tx_worker_packets, txq.stats.tx_worker_kicks,
+           double(txq.stats.tx_worker_packets)/txq.stats.tx_worker_kicks);
+    printf("worker packet(%d)/worker wakeup(%d) %.2f\n",
+           txq.stats.tx_worker_packets, txq.stats.tx_worker_wakeups,
+           double(txq.stats.tx_worker_packets)/txq.stats.tx_worker_wakeups);
+#endif
 }
 
 bool net::ack_irq()
@@ -247,7 +268,7 @@ net::net(pci::device& dev)
     if_initname(_ifn, "eth", _id);
     _ifn->if_mtu = ETHERMTU;
     _ifn->if_softc = static_cast<void*>(this);
-    _ifn->if_flags = IFF_BROADCAST /*| IFF_MULTICAST*/;
+    _ifn->if_flags = IFF_BROADCAST | IFF_MULTICAST;
     _ifn->if_ioctl = if_ioctl;
     _ifn->if_transmit = if_transmit;
     _ifn->if_qflush = if_qflush;
@@ -612,8 +633,7 @@ int net::txq::try_xmit_one_locked(net_req* req)
     }
 
     vqueue->init_sg();
-    vqueue->add_out_sg(static_cast<void*>(&req->mhdr),
-                       sizeof(net_hdr_mrg_rxbuf));
+    vqueue->add_out_sg(static_cast<void*>(&req->mhdr), _parent->_hdr_size);
 
     for (m = m_head; m != NULL; m = m->m_hdr.mh_next) {
         int frag_len = m->m_hdr.mh_len;

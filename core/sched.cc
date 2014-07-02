@@ -679,6 +679,14 @@ thread::thread(std::function<void ()> func, attr attr, bool main)
         }
         remote_thread_local_var(current_cpu) = _detached_state->_cpu;
     }
+
+    // For debugging purposes, it is useful for threads to have names. If no
+    // name was set for this one, set one by prepending ">" to parent's name.
+    if (!_attr._name[0] && s_current) {
+        _attr._name[0] = '>';
+        strncpy(_attr._name.data()+1, s_current->_attr._name.data(),
+                sizeof(_attr._name) - 2);
+    }
 }
 
 static std::list<std::function<void (thread *)>> exit_notifiers;
@@ -1381,6 +1389,15 @@ thread_runtime::time_until(runtime_t target_local_runtime) const
         return thread_runtime::duration(-1);
     return thread_runtime::duration((thread_runtime::duration::rep) ret);
 }
+
+void with_all_threads(std::function<void(thread &)> f) {
+    WITH_LOCK(thread_map_mutex) {
+        for (auto th : thread_map) {
+            f(*th.second);
+        }
+    }
+}
+
 
 }
 
