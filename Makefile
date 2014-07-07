@@ -36,7 +36,7 @@ $(submake) $(modulemk): Makefile prepare-dir
 	echo 'VPATH = $(abspath .)' >> $@
 	echo 'include $(abspath build.mk)' >> $@
 
-.PHONEY: prepare-dir
+.PHONY: prepare-dir
 
 prepare-dir:
 	# transition from build/release being the output directory
@@ -45,10 +45,14 @@ prepare-dir:
 	mkdir -p $(out)
 	ln -nsf $(notdir $(out)) $(outlink)
 
-clean:
+clean-core:
 	$(call quiet, rm -rf $(outlink) $(out), CLEAN)
-	$(call only-if, $(mgmt), $(call quiet, $(MAKE) -C mgmt clean >> /dev/null, MGMT CLEAN))
 	$(call quiet, cd java && mvn clean -q, MVN CLEAN)
+.PHONY: clean-core
+
+clean: clean-core
+	$(call quiet, OSV_BASE=. MAKEFLAGS= scripts/module.py clean -q, MODULES CLEAN)
+.PHONY: clean
 
 check: export image ?= tests
 

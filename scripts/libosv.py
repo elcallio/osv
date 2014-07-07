@@ -15,14 +15,15 @@ version = """
         .long 2f-1f;
         .long 4f-3f;
         .long 1;
-        .align 4;
+        .balign 4;
 1:
         .asciz "OSv";
 2:
-        .align 4;
+        .balign 4;
 3:
         .asciz "%s";
 4:
+	.balign 4;
 """%(version_str)
 
 for line in f.readlines():

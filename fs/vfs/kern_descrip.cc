@@ -158,8 +158,6 @@ file::file(unsigned flags, filetype_t type, void *opaque)
     , f_data(opaque)
     , f_type(type)
 {
-    auto fp = this;
-    TAILQ_INIT(&fp->f_poll_list);
 }
 
 void fhold(struct file* fp)
@@ -180,18 +178,23 @@ int fdrop(struct file *fp)
 
     fp->f_count = INT_MIN;
     fp->close();
+    fp->stop_polls();
     delete fp;
     return 1;
 }
 
 file::~file()
 {
+}
+
+void file::stop_polls()
+{
     auto fp = this;
 
     poll_drain(fp);
     if (f_epolls) {
         for (auto ep : *f_epolls) {
-            epoll_file_closed(ep, this);
+            epoll_file_closed(ep);
         }
     }
 }

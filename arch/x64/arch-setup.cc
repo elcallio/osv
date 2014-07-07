@@ -17,6 +17,7 @@
 #include <alloca.h>
 #include <string.h>
 #include <osv/boot.hh>
+#include <osv/commands.hh>
 
 struct multiboot_info_type {
     u32 flags;
@@ -57,22 +58,10 @@ struct e820ent {
 
 osv_multiboot_info_type* osv_multiboot_info;
 
-extern char** __argv;
-extern int __argc;
-
 void parse_cmdline(multiboot_info_type& mb)
 {
     auto p = reinterpret_cast<char*>(mb.cmdline);
-    char* cmdline = strdup(p);
-    static std::vector<char*> args;
-    char* save;
-    while ((p = strtok_r(cmdline, " \t\n", &save)) != nullptr) {
-        args.push_back(p);
-        cmdline = nullptr;
-    }
-    args.push_back(nullptr);
-    __argv = args.data();
-    __argc = args.size() - 1;
+    osv::parse_cmdline(p);
 }
 
 void setup_temporary_phys_map()
@@ -268,16 +257,19 @@ void arch_init_drivers()
 #include "drivers/console.hh"
 #include "drivers/isa-serial.hh"
 #include "drivers/vga.hh"
+#include "early-console.hh"
 
 bool arch_setup_console(std::string opt_console)
 {
+    hw::driver_manager* drvman = hw::driver_manager::instance();
+
     if (opt_console.compare("serial") == 0) {
-        console::console_driver_add(new console::isa_serial_console());
+        console::console_driver_add(&console::arch_early_console);
     } else if (opt_console.compare("vga") == 0) {
-        console::console_driver_add(new console::VGAConsole());
+        drvman->register_driver(console::VGAConsole::probe);
     } else if (opt_console.compare("all") == 0) {
-        console::console_driver_add(new console::isa_serial_console());
-        console::console_driver_add(new console::VGAConsole());
+        console::console_driver_add(&console::arch_early_console);
+        drvman->register_driver(console::VGAConsole::probe);
     } else {
         return false;
     }

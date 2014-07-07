@@ -52,16 +52,6 @@ TRACEPOINT(trace_memory_wait, "allocation size=%d", size_t);
 bool smp_allocator = false;
 unsigned char *osv_reclaimer_thread;
 
-// malloc(3) specifies that malloc(), calloc() and realloc() need to return
-// a pointer which "is suitably aligned for any kind of variable.". By "any"
-// variable they actually refer only to standard types, but the longest of
-// these is usually "long double", which is 16 bytes. Glibc's malloc(),
-// with which we intend to be compatible, takes the maximum of 2*sizeof(size_t)
-// and the alignof(long double), so we must do the same.
-static constexpr int MALLOC_ALIGNMENT =
-        (2 * sizeof(size_t) < alignof(long double)) ?
-                alignof(long double) : (2 * sizeof(size_t));
-
 namespace memory {
 
 size_t phys_mem_size;
@@ -188,7 +178,7 @@ pool::~pool()
 }
 
 // FIXME: handle larger sizes better, while preserving alignment:
-const size_t pool::max_object_size = page_size / 2;
+const size_t pool::max_object_size = page_size / 4;
 const size_t pool::min_object_size = sizeof(free_object);
 
 pool::page_header* pool::to_header(free_object* object)
@@ -1107,30 +1097,17 @@ static inline void* std_malloc(size_t size, size_t alignment)
     if ((ssize_t)size < 0)
         return libc_error_ptr<void *>(ENOMEM);
     void *ret;
-
-    // Currently, we can't allocate a small object with large alignment,
-    // so need to increase the allocation size.
-    auto requested_size = size;
-    if (alignment > size) {
-        if (alignment <= mmu::page_size) {
-            size = alignment;
-        } else {
-            size = std::max(size, mmu::page_size * 2);
-        }
-    }
-
-    if (size <= memory::pool::max_object_size && smp_allocator) {
+    if (size <= memory::pool::max_object_size && alignment <= size && smp_allocator) {
         size = std::max(size, memory::pool::min_object_size);
         unsigned n = ilog2_roundup(size);
         ret = memory::malloc_pools[n].alloc();
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
-        trace_memory_malloc_mempool(ret, requested_size, 1 << n, alignment);
-    } else if (size <= mmu::page_size) {
+        trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
+    } else if (size <= mmu::page_size && alignment <= mmu::page_size) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page,
                                        memory::alloc_page());
-        trace_memory_malloc_page(ret, requested_size, mmu::page_size,
-                                 alignment);
+        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
         ret = memory::malloc_large(size, alignment);
     }
@@ -1297,8 +1274,12 @@ void free(void* v)
 
 void* realloc(void* v, size_t size)
 {
+    auto alignment = alignof(max_align_t);
+    if (alignment > size) {
+        alignment = 1ul << ilog2_roundup(size);
+    }
     if (!v)
-        return malloc(size, MALLOC_ALIGNMENT);
+        return malloc(size, alignment);
     if (!size) {
         free(v);
         return nullptr;
@@ -1306,7 +1287,7 @@ void* realloc(void* v, size_t size)
     auto h = static_cast<header*>(v - pad_before);
     if (h->size >= size)
         return v;
-    void* n = malloc(size, MALLOC_ALIGNMENT);
+    void* n = malloc(size, alignment);
     if (!n)
         return nullptr;
     memcpy(n, v, h->size);
@@ -1318,13 +1299,19 @@ void* realloc(void* v, size_t size)
 
 void* malloc(size_t size)
 {
+    static_assert(alignof(max_align_t) >= 2 * sizeof(size_t),
+                  "alignof(max_align_t) smaller than glibc alignment guarantee");
+    auto alignment = alignof(max_align_t);
+    if (alignment > size) {
+        alignment = 1ul << ilog2_roundup(size);
+    }
 #if CONF_debug_memory == 0
-    void* buf = std_malloc(size, MALLOC_ALIGNMENT);
+    void* buf = std_malloc(size, alignment);
 #else
-    void* buf = dbg::malloc(size, MALLOC_ALIGNMENT);
+    void* buf = dbg::malloc(size, alignment);
 #endif
 
-    trace_memory_malloc(buf, size, MALLOC_ALIGNMENT);
+    trace_memory_malloc(buf, size, alignment);
     return buf;
 }
 
