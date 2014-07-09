@@ -31,6 +31,7 @@
 #include <osv/mempool.hh>
 #include <bsd/porting/networking.hh>
 #include <bsd/porting/shrinker.h>
+#include <bsd/porting/route.h>
 #include <osv/dhcp.hh>
 #include <osv/version.h>
 #include <osv/run.hh>
@@ -38,11 +39,16 @@
 #include <osv/commands.hh>
 #include <osv/boot.hh>
 #include <osv/sampler.hh>
+#include <dirent.h>
+#include <iostream>
+#include <fstream>
 
 #include "drivers/zfs.hh"
 #include "drivers/random.hh"
 #include "drivers/console.hh"
 #include "drivers/null.hh"
+
+#include "libc/network/__dns.hh"
 
 using namespace osv;
 
@@ -117,10 +123,14 @@ static bool opt_noshutdown = false;
 static bool opt_log_backtrace = false;
 static bool opt_mount = true;
 static bool opt_random = true;
+static bool opt_init = true;
 static std::string opt_console = "all";
 static bool opt_verbose = false;
 static std::string opt_chdir;
 static bool opt_bootchart = false;
+static std::vector<std::string> opt_ip;
+static std::string opt_defaultgw;
+static std::string opt_nameserver;
 
 static int sampler_frequency;
 static bool opt_enable_sampler = false;
@@ -150,11 +160,15 @@ std::tuple<int, char**> parse_options(int ac, char** av)
         ("nomount", "don't mount the file system")
         ("norandom", "don't initialize any random device")
         ("noshutdown", "continue running after main() returns")
+        ("noinit", "don't run commands from /init")
         ("verbose", "be verbose, print debug messages")
         ("console", bpo::value<std::vector<std::string>>(), "select console driver")
         ("env", bpo::value<std::vector<std::string>>(), "set Unix-like environment variable (putenv())")
         ("cwd", bpo::value<std::vector<std::string>>(), "set current working directory")
         ("bootchart", "perform a test boot measuring a time distribution of the various operations\n")
+        ("ip", bpo::value<std::vector<std::string>>(), "set static IP on NIC")
+        ("defaultgw", bpo::value<std::string>(), "set default gateway address")
+        ("nameserver", bpo::value<std::string>(), "set nameserver address")
     ;
     bpo::variables_map vars;
     // don't allow --foo bar (require --foo=bar) so we can find the first non-option
@@ -211,6 +225,7 @@ std::tuple<int, char**> parse_options(int ac, char** av)
     }
     opt_mount = !vars.count("nomount");
     opt_random = !vars.count("norandom");
+    opt_init = !vars.count("noinit");
 
     if (vars.count("console")) {
         auto v = vars["console"].as<std::vector<std::string>>();
@@ -234,6 +249,18 @@ std::tuple<int, char**> parse_options(int ac, char** av)
             printf("Ignoring '--cwd' options after the first.");
         }
         opt_chdir = v.front();
+    }
+
+    if (vars.count("ip")) {
+        opt_ip = vars["ip"].as<std::vector<std::string>>();
+    }
+
+    if (vars.count("defaultgw")) {
+        opt_defaultgw = vars["defaultgw"].as<std::string>();
+    }
+
+    if (vars.count("nameserver")) {
+        opt_nameserver = vars["nameserver"].as<std::string>();
     }
 
     av += nr_options;
@@ -318,6 +345,13 @@ void *_run_main(void *data)
     return nullptr;
 }
 
+static std::string read_file(std::string fn)
+{
+  std::ifstream in(fn, std::ios::in | std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+          std::istreambuf_iterator<char>());
+}
+
 void* do_main_thread(void *_commands)
 {
     auto commands =
@@ -353,7 +387,27 @@ void* do_main_thread(void *_commands)
             debug("Could not initialize network interface.\n");
     });
     if (has_if) {
-        dhcp_start(true);
+        if (opt_ip.size() == 0) {
+            dhcp_start(true);
+        } else {
+            for (auto t : opt_ip) {
+                std::vector<std::string> tmp;
+                boost::split(tmp, t, boost::is_any_of(" ,"), boost::token_compress_on);
+                if (tmp.size() != 3)
+                    abort("incorrect parameter on --ip");
+                if (osv::start_if(tmp[0], tmp[1], tmp[2]) != 0)
+                    debug("Could not initialize network interface.\n");
+            }
+            if (opt_defaultgw.size() != 0) {
+                osv_route_add_network("0.0.0.0",
+                                      "0.0.0.0",
+                                      opt_defaultgw.c_str());
+            }
+            if (opt_nameserver.size() != 0) {
+                auto addr = boost::asio::ip::address_v4::from_string(opt_nameserver);
+                osv::set_dns_config({addr}, std::vector<std::string>());
+            }
+        }
     }
 
     if (!opt_chdir.empty()) {
@@ -367,20 +421,50 @@ void* do_main_thread(void *_commands)
 
     boot_time.event("Total time");
 
+    // Run command lines in /init/* before the manual command line
+    if (opt_init) {
+        std::vector<std::vector<std::string>> init_commands;
+        struct dirent **namelist;
+        int count = scandir("/init", &namelist, NULL, alphasort);
+        for (int i = 0; i < count; i++) {
+            if (!strcmp(".", namelist[i]->d_name) ||
+                    !strcmp("..", namelist[i]->d_name)) {
+                continue;
+            }
+            std::string fn("/init/");
+            fn += namelist[i]->d_name;
+            auto cmdline = read_file(fn);
+            debug("Running from %s: %s\n", fn.c_str(), cmdline.c_str());
+            bool ok;
+            auto new_commands = osv::parse_command_line(cmdline, ok);
+            free(namelist[i]);
+            if (ok) {
+                init_commands.insert(init_commands.end(),
+                        new_commands.begin(), new_commands.end());
+            }
+        }
+        free(namelist);
+        commands->insert(commands->begin(),
+                 init_commands.begin(), init_commands.end());
+    }
+
     // run each payload in order
     // Our parse_command_line() leaves at the end of each command a delimiter,
     // can be '&' if we need to run this command in a new thread, or ';' or
-    // empty otherwise, to run in this thread.
+    // empty otherwise, to run in this thread. '&!' is the same as '&', but
+    // doesn't wait for the thread to finish before exiting OSv.
     std::vector<pthread_t> bg;
     for (auto &it : *commands) {
         std::vector<std::string> newvec(it.begin(), std::prev(it.end()));
-        if (it.back() != "&") {
+        if (it.back() != "&" && it.back() != "&!") {
             run_main(newvec);
         } else {
             pthread_t t;
             pthread_create(&t, nullptr, _run_main,
                     new std::vector<std::string> (newvec));
-            bg.push_back(t);
+            if (it.back() != "&!") {
+                bg.push_back(t);
+            }
         }
     }
 
