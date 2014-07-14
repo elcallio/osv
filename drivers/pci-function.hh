@@ -223,11 +223,13 @@ namespace pci {
         };
 
         enum pci_class_codes {
-            PCI_CLASS_STORAGE   = 0x01
+            PCI_CLASS_STORAGE       = 0x01,
+            PCI_CLASS_DISPLAY       = 0x03
         };
 
         enum pci_sub_class_codes {
-            PCI_SUB_CLASS_STORAGE_IDE = 0x01
+            PCI_SUB_CLASS_STORAGE_IDE       = 0x01,
+            PCI_SUB_CLASS_STORAGE_AHCI      = 0x06,
         };
 
         function(u8 bus, u8 device, u8 func);

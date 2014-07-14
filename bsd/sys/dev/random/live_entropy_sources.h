@@ -30,6 +30,10 @@
 #ifndef SYS_DEV_RANDOM_LIVE_ENTROPY_SOURCES_H_INCLUDED
 #define SYS_DEV_RANDOM_LIVE_ENTROPY_SOURCES_H_INCLUDED
 
+#include <dev/random/random_harvestq.h>
+
+__BEGIN_DECLS
+
 /*
  * Live entropy source is a source of entropy that can provide
  * specified or approximate amount of entropy immediately upon request or within
@@ -42,6 +46,8 @@ struct live_entropy_sources {
 
 extern struct mtx live_mtx;
 
+void live_entropy_sources_init(void *);
+void live_entropy_sources_deinit(void *);
 void live_entropy_source_register(struct random_hardware_source *);
 void live_entropy_source_deregister(struct random_hardware_source *);
 void live_entropy_sources_feed(int, event_proc_f);
@@ -56,5 +62,7 @@ void live_entropy_sources_feed(int, event_proc_f);
 		   SI_ORDER_SECOND);				\
     MODULE_VERSION(name, ver);					\
     MODULE_DEPEND(name, random, 1, 1, 1);
+
+__END_DECLS
 
 #endif /* SYS_DEV_RANDOM_LIVE_ENTROPY_SOURCES_H_INCLUDED */
