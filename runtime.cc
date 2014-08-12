@@ -103,7 +103,8 @@ static void print_backtrace(void)
     }
 }
 
-static bool already_aborted = false;
+static std::atomic<bool> aborting { false };
+
 void abort()
 {
     abort("Aborted\n");
@@ -111,31 +112,34 @@ void abort()
 
 void abort(const char *fmt, ...)
 {
-    if (!already_aborted) {
-        arch::irq_disable();
-        already_aborted = true;
-
-        static char msg[1024];
-        va_list ap;
-
-        va_start(ap, fmt);
-        vsnprintf(msg, sizeof(msg), fmt, ap);
-        va_end(ap);
-
-        debug_early(msg);
-        // backtrace requires threads to be available, and also
-        // ELF s_program to be initialized. Since s_program happens
-        // later, this check is enough to ensure a minimal fallback
-        // functionality even early on.
-        if (elf::get_program() != nullptr) {
-            print_backtrace();
-        } else {
-            debug_early("Halting.\n");
-        }
-#ifndef AARCH64_PORT_STUB
-        panic::pvpanic::panicked();
-#endif /* !AARCH64_PORT_STUB */
+    bool expected = false;
+    if (!aborting.compare_exchange_strong(expected, true)) {
+        do {} while (true);
     }
+
+    arch::irq_disable();
+
+    static char msg[1024];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    debug_early(msg);
+    // backtrace requires threads to be available, and also
+    // ELF s_program to be initialized. Since s_program happens
+    // later, this check is enough to ensure a minimal fallback
+    // functionality even early on.
+    if (elf::get_program() != nullptr) {
+        print_backtrace();
+    } else {
+        debug_early("Halting.\n");
+    }
+#ifndef AARCH64_PORT_STUB
+    panic::pvpanic::panicked();
+#endif /* !AARCH64_PORT_STUB */
+
     osv::halt();
 }
 
@@ -443,11 +447,13 @@ static int prio_find_thread(sched::thread **th, int which, int id)
 }
 
 // Our priority formula is osv_prio = e^(prio * k), where k is a constant.
-// We (arbitrarily) want osv_prio(20) = 5, and osv_prio(-20) = 1/5.
+// We want osv_prio(20) = 86, and osv_prio(-20) = 1/86, as this gives the
+// best agreement with Linux's current interpretation of the nice values
+// (see tests/misc-setpriority.cc).
 //
-// So e^(20 * prio_k) = 5
-//    20 * prio_k = ln(5)
-//    prio_k = ln(5) / 20
+// So e^(20 * prio_k) = 86
+//    20 * prio_k = ln(86)
+//    prio_k = ln(86) / 20
 //
 // When we are given OSv prio, obviously, the inverse formula applies:
 //
@@ -455,7 +461,7 @@ static int prio_find_thread(sched::thread **th, int which, int id)
 //    prio * prio_k = ln(osv_prio)
 //    prio = ln(osv_prio) / prio_k
 //
-static constexpr float prio_k = log(5) / 20;
+static constexpr float prio_k = log(86) / 20;
 
 int getpriority(int which, int id)
 {

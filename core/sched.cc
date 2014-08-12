@@ -8,6 +8,7 @@
 #include <osv/sched.hh>
 #include <list>
 #include <osv/mutex.h>
+#include <osv/rwlock.h>
 #include <mutex>
 #include <osv/debug.hh>
 #include <osv/irqlock.hh>
@@ -26,6 +27,7 @@
 #include <unordered_map>
 #include <osv/wait_record.hh>
 #include <osv/preempt-lock.hh>
+#include <osv/app.hh>
 
 // By taking the address of these functions, we force the compiler to generate
 // a symbol for it even when the function is inlined into all call sites. In a
@@ -35,6 +37,7 @@
 #define _MAKE_SYMBOL(name, num) __MAKE_SYMBOL(name, num)
 #define MAKE_SYMBOL(name) _MAKE_SYMBOL(name, __COUNTER__)
 MAKE_SYMBOL(sched::thread::current);
+MAKE_SYMBOL(sched::cpu::current);
 MAKE_SYMBOL(sched::get_preempt_counter);
 MAKE_SYMBOL(sched::preemptable);
 MAKE_SYMBOL(sched::preempt);
@@ -292,6 +295,7 @@ void cpu::reschedule_from_interrupt()
         p->_runtime.hysteresis_run_stop();
         p->_detached_state->st.store(thread::status::queued);
         enqueue(*p);
+        trace_sched_preempt();
     } else {
         // p is no longer running, so we'll switch to a different thread.
         // Return the runtime p borrowed for hysteresis.
@@ -722,6 +726,14 @@ thread::thread(std::function<void ()> func, attr attr, bool main)
     // do that for us instead)
     if (!main && sched::s_current) {
         remote_thread_local_var(s_current) = this;
+
+        const auto& app = application::get_current();
+        if (app) {
+            _func = [app, func] {
+                app->adopt_current();
+                func();
+            };
+        }
     }
     init_stack();
 
@@ -751,13 +763,25 @@ thread::thread(std::function<void ()> func, attr attr, bool main)
     }
 }
 
-static std::list<std::function<void (thread *)>> exit_notifiers;
-void thread::register_exit_notifier(std::function<void (thread *)> &&n)
+static std::list<std::function<void ()>> exit_notifiers
+        __attribute__((init_priority((int)init_prio::threadlist)));
+static rwlock exit_notifiers_lock
+        __attribute__((init_priority((int)init_prio::threadlist)));
+void thread::register_exit_notifier(std::function<void ()> &&n)
 {
-    WITH_LOCK(thread_map_mutex) {
+    WITH_LOCK(exit_notifiers_lock.for_write()) {
         exit_notifiers.push_front(std::move(n));
     }
 }
+static void run_exit_notifiers()
+{
+    WITH_LOCK(exit_notifiers_lock.for_read()) {
+        for (auto& notifier : exit_notifiers) {
+            notifier();
+        }
+    }
+}
+
 
 thread::~thread()
 {
@@ -769,10 +793,6 @@ thread::~thread()
     WITH_LOCK(thread_map_mutex) {
         thread_map.erase(_id);
         total_app_time_exited += _total_cpu_time;
-
-        for (auto& notifier : exit_notifiers) {
-            notifier(this);
-        }
     }
     if (_attr._stack.deleter) {
         _attr._stack.deleter(_attr._stack);
@@ -942,6 +962,8 @@ void thread::stop_wait()
 
 void thread::complete()
 {
+    run_exit_notifiers();
+
     auto value = detach_state::attached;
     _detach_state.compare_exchange_strong(value, detach_state::attached_complete);
     if (value == detach_state::detached) {

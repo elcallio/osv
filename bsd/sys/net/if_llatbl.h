@@ -33,6 +33,7 @@
 #include <bsd/porting/rwlock.h>
 
 #include <bsd/sys/netinet/in.h>
+#include <bsd/sys/netinet/arpcache.hh>
 
 struct ifnet;
 struct sysctl_req;
@@ -159,6 +160,9 @@ struct lltable {
 				    u_int flags);
 	struct llentry *	(*llt_lookup)(struct lltable *, u_int flags,
 				    const struct bsd_sockaddr *l3addr);
+	bool			(*llt_lookup_fast)(struct lltable *, u_int flags,
+				    const struct bsd_sockaddr *l3addr,
+				    arp_cache::mac_address& mac, u16& la_flags);
 	int			(*llt_dump)(struct lltable *,
 				    struct sysctl_req *);
 };
@@ -188,9 +192,6 @@ struct lltable *lltable_init(struct ifnet *, int);
 void		lltable_free(struct lltable *);
 void		lltable_prefix_free(int, struct bsd_sockaddr *,
 		    struct bsd_sockaddr *, u_int);
-#if 0
-void		lltable_drain(int);
-#endif
 int		lltable_sysctl_dumparp(int, struct sysctl_req *);
 
 size_t		llentry_free(struct llentry *);
@@ -205,6 +206,13 @@ static __inline struct llentry *
 lla_lookup(struct lltable *llt, u_int flags, const struct bsd_sockaddr *l3addr)
 {
 	return llt->llt_lookup(llt, flags, l3addr);
+}
+
+static __inline bool
+lla_lookup_fast(struct lltable *llt, u_int flags, const struct bsd_sockaddr *l3addr,
+		arp_cache::mac_address& mac, u16& la_flags)
+{
+	return llt->llt_lookup_fast(llt, flags, l3addr, mac, la_flags);
 }
 
 int		lla_rt_output(struct rt_msghdr *, struct rt_addrinfo *);

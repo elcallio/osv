@@ -6,9 +6,13 @@
  */
 
 #include "cloud-init.hh"
+#include "files-module.hh"
+#include "server-module.hh"
 #include <boost/program_options/variables_map.hpp>
 #include <boost/program_options/options_description.hpp>
 #include <boost/program_options/parsers.hpp>
+#include <osv/debug.hh>
+#include <osv/exception_utils.hh>
 
 using namespace std;
 using namespace init;
@@ -24,8 +28,6 @@ int main(int argc, char* argv[])
         ("help", "produce help message")
         ("skip-error",
          "do not stop on error")
-        ("once",
-         "when set, prevent a file to be read more than once")
         ("file", po::value<std::string>(),
          "an init file")
         ("server", po::value<std::string>(),
@@ -44,31 +46,28 @@ int main(int argc, char* argv[])
             std::cerr << desc << "\n";
             return 1;
         }
-        osvinit init(config.count("skip-error") > 0);
-        YAML::Node entry;
 
-        entry["GET"] = "/include";
+        osvinit init(config.count("skip-error") > 0);
+        auto scripts = make_shared<script_module>();
+        init.add_module(scripts);
+        init.add_module(make_shared<files_module>());
+        init.add_module(make_shared<server_module>());
+        init.add_module(make_shared<include_module>(init));
+
         if (config.count("file")) {
-            entry["path"] = config["file"].as<std::string>();
+            init.load_file(config["file"].as<std::string>());
         } else if (config.count("server") > 0 && config.count("url") > 0) {
-            entry["host"] = config["server"].as<std::string>();
-            entry["url"] = config["url"].as<std::string>();
-            entry["port"] = config["port"].as<std::string>();
+            init.load_url(config["server"].as<std::string>(),
+                config["url"].as<std::string>(),
+                config["port"].as<std::string>());
         } else {
-            std::cerr << desc << "\n";
-            return 1;
+            init.load_from_cloud();
         }
-        if (config.count("once")) {
-            entry["once"] = "True";
-        }
-        YAML::Node node;
-        node.push_back(entry);
-        init.do_yaml(node);
-        init.wait();
-    }
-    catch (std::exception& e)
-    {
-        std::cerr << "Exception: " << e.what() << "\n";
+
+        scripts->wait();
+    } catch (...) {
+        std::cerr << "cloud-init failed: " << what(std::current_exception()) << "\n";
+        return 1;
     }
 
     return 0;

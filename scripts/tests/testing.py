@@ -183,6 +183,8 @@ class Guest(SupervisedProcess):
         for rule in forward:
             args.extend(['--forward', 'tcp:%s::%s' % rule])
 
+        args.extend(['--unsafe-cache'])
+
         SupervisedProcess.__init__(self, [run_script] + args,
             show_output=_verbose_output,
             show_output_on_error=show_output_on_error)
@@ -190,8 +192,8 @@ class Guest(SupervisedProcess):
     def send_command(self, command):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(self.monitor_socket)
-        s.send(command)
-        s.send('\n')
+        s.send(command.encode())
+        s.send(b'\n')
         s.close()
 
     def kill(self):

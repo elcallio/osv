@@ -24,40 +24,47 @@ namespace http {
 
 namespace server {
 
-void request_handler::update_param(request& req, size_t bg, size_t end)
-{
-    if (bg == end) {
-        return;
-    }
-    req.query_parameters.push_back(header());
-    size_t eq;
-    if ((eq = req.uri.find('=', bg)) < end) {
-        req.query_parameters.back().name = req.uri.substr(bg, eq - bg);
-        request_handler::url_decode(req.uri.substr(eq + 1, end - eq - 1),
-                                    req.query_parameters.back().value);
-    } else {
-        req.query_parameters.back().name = req.uri.substr(bg, end - bg);
-        req.query_parameters.back().value = "";
-    }
-}
-
 size_t request_handler::update_parameters(request& req)
 {
-    size_t par = req.uri.find('?');
-    if (par != std::string::npos) {
+    auto update_param = [&req](const std::string & s, size_t bg, size_t end) {
+        if (bg == end) {
+            return;
+        }
+        req.query_parameters.push_back(header());
+        size_t eq;
+        if ((eq = s.find('=', bg)) < end) {
+            req.query_parameters.back().name = s.substr(bg, eq - bg);
+            request_handler::url_decode(s.substr(eq + 1, end - eq - 1),
+                                        req.query_parameters.back().value);
+        } else {
+            req.query_parameters.back().name = s.substr(bg, end - bg);
+            req.query_parameters.back().value = "";
+        }
+    };
+    auto parse_str = [&](const std::string & s, size_t bg) {
         size_t end;
-        size_t bg = par+1;
-        while ((end = req.uri.find('&', bg)) != std::string::npos) {
-            update_param(req, bg, end);
+        while ((end = s.find('&', bg)) != std::string::npos) {
+            update_param(s, bg, end);
             bg = end +1;
         }
-        update_param(req, bg, req.uri.length());
+        update_param(s, bg, s.length());
+    };
+
+    if (req.is_form_post()) {
+        parse_str(req.content, 0);
+    }
+
+    size_t par = req.uri.find('?');
+    if (par != std::string::npos) {
+        parse_str(req.uri, par+1);
     }
     return par;
 }
 
-request_handler::request_handler(httpserver::routes* routes)
-    : routes(routes)
+request_handler::request_handler(httpserver::routes* routes, const boost::program_options::variables_map& _config)
+    : routes(routes),
+      config(_config)
+
 {
 }
 
@@ -82,6 +89,9 @@ void request_handler::handle_request(request& req, reply& rep)
     }
 
     routes->handle(request_path, req, rep);
+    if (config.count("access-allow")) {
+        rep.add_header("Access-Control-Allow-Origin", "*");
+    }
 }
 
 bool request_handler::url_decode(const std::string& in, std::string& out,

@@ -60,6 +60,12 @@ int _fdalloc(struct file *fp, int *newfd, int min_fd)
     return EMFILE;
 }
 
+extern "C"
+int getdtablesize(void)
+{
+    return FDMAX;
+}
+
 /*
  * Allocate a file descriptor and assign fd to it atomically.
  *
@@ -160,6 +166,18 @@ file::file(unsigned flags, filetype_t type, void *opaque)
 {
 }
 
+void file::wake_epoll(int events)
+{
+    WITH_LOCK(f_lock) {
+        if (!f_epolls) {
+            return;
+        }
+        for (auto&& ep : *f_epolls) {
+            epoll_wake(ep);
+        }
+    }
+}
+
 void fhold(struct file* fp)
 {
     __sync_fetch_and_add(&fp->f_count, 1);
@@ -177,9 +195,9 @@ int fdrop(struct file *fp)
      */
 
     fp->f_count = INT_MIN;
-    fp->close();
     fp->stop_polls();
-    delete fp;
+    fp->close();
+    rcu_dispose(fp);
     return 1;
 }
 

@@ -2,25 +2,31 @@ build_env ?= external
 ifeq ($(build_env), host)
     gcc_lib_env ?= host
     cxx_lib_env ?= host
+    gcc_include_env ?= host
 else
     gcc_lib_env ?= external
     cxx_lib_env ?= external
+    gcc_include_env ?= external
 endif
 
 detect_arch=$(shell echo $(1) | $(CC) -E -xc - | tail -n 1)
 
 ifeq ($(call detect_arch, __x86_64__),1)
     host_arch = x64
+	host_arch_str = x86_64
 endif
 ifeq ($(call detect_arch, __aarch64__),1)
     host_arch = aarch64
+	host_arch_str = aarch64
 endif
 
 ifndef ARCH
   ARCH = $(host_arch)
+  ARCH_STR = $(host_arch_str)
 endif
 
 arch = $(ARCH)
+arch_str = $(ARCH)
 
 $(info build.mk:)
 $(info build.mk: building arch=$(arch), override with ARCH env)
@@ -36,7 +42,13 @@ LD=$(CROSS_PREFIX)ld
 STRIP=$(CROSS_PREFIX)strip
 OBJCOPY=$(CROSS_PREFIX)objcopy
 
+ifeq ($(arch),aarch64)
+image ?= uush
+else
 image ?= default
+endif
+
+modules ?= !$(image)
 img_format ?= qcow2
 fs_size_mb ?= 10240
 local-includes =
@@ -53,8 +65,10 @@ gcc-inc-base := $(dir $(shell find $(gccbase)/ -name vector | grep -v -e debug/v
 gcc-inc-base2 := $(dir $(shell find $(gccbase)/ -name unwind.h))
 gcc-inc-base3 := $(dir $(shell dirname `find $(gccbase)/ -name c++config.h | grep -v /32/`))
 
-INCLUDES += -isystem $(gcc-inc-base)
-INCLUDES += -isystem $(gcc-inc-base3)
+ifeq ($(gcc_include_env), external)
+  INCLUDES += -isystem $(gcc-inc-base)
+  INCLUDES += -isystem $(gcc-inc-base3)
+endif
 
 ifeq ($(arch),x64)
 INCLUDES += -isystem $(src)/external/$(arch)/acpica/source/include
@@ -63,8 +77,10 @@ endif
 INCLUDES += -isystem $(miscbase)/usr/include
 INCLUDES += -isystem $(src)/include/api
 INCLUDES += -isystem $(src)/include/api/$(arch)
-# must be after include/api, since it includes some libc-style headers:
-INCLUDES += -isystem $(gcc-inc-base2)
+ifeq ($(gcc_include_env), external)
+  # must be after include/api, since it includes some libc-style headers:
+  INCLUDES += -isystem $(gcc-inc-base2)
+endif
 INCLUDES += -isystem gen/include
 INCLUDES += $(post-includes-bsd)
 
@@ -88,6 +104,7 @@ bsd/%.o: source-dialects =
 
 # libc has its own source dialect control
 libc/%.o: source-dialects =
+musl/%.o: source-dialects =
 
 kernel-defines = -D_KERNEL $(source-dialects)
 
@@ -107,6 +124,7 @@ gcc-sysroot = $(if $(CROSS_PREFIX), --sysroot $(src)/external/$(arch)/gcc.bin) \
 #
 #   mydir/*.o EXTRA_FLAGS = <MY_STUFF>
 EXTRA_FLAGS = -D__OSV_CORE__
+EXTRA_LIBS =
 COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -Wno-format-security \
 	-D __BSD_VISIBLE=1 -U _FORTIFY_SOURCE -fno-stack-protector $(INCLUDES) \
 	$(kernel-defines) \
@@ -114,7 +132,10 @@ COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -
 	-include $(src)/compiler/include/intrinsics.hh \
 	$(do-sys-includes) \
 	$(arch-cflags) $(conf-opt) $(acpi-defines) $(tracing-flags) $(gcc-sysroot) \
-	$(configuration) -nostdinc -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207" $(EXTRA_FLAGS)
+	$(configuration) -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207" -DARCH_STRING=$(ARCH_STR) $(EXTRA_FLAGS)
+ifeq ($(gcc_include_env), external)
+  COMMON += -nostdinc
+endif
 
 tracing-flags-0 =
 tracing-flags-1 = -finstrument-functions -finstrument-functions-exclude-file-list=c++,trace.cc,trace.hh,align.hh
@@ -126,7 +147,7 @@ CXXFLAGS = -std=gnu++11 $(COMMON)
 CFLAGS = -std=gnu99 $(COMMON)
 
 # should be limited to files under libc/ eventually
-CFLAGS += -I $(src)/libc/internal -I  $(src)/libc/arch/$(arch) \
+CFLAGS += -I $(src)/libc/stdio -I $(src)/libc/internal -I  $(src)/libc/arch/$(arch) \
 	-Wno-missing-braces -Wno-parentheses -Wno-unused-but-set-variable
 
 ASFLAGS = -g $(autodepend) -DASSEMBLY
@@ -157,7 +178,7 @@ build-c = $(CC) $(CFLAGS) -c -o $@ $<
 q-build-c = $(call quiet, $(build-c), CC $@)
 build-s = $(CXX) $(CXXFLAGS) $(ASFLAGS) -c -o $@ $<
 q-build-s = $(call quiet, $(build-s), AS $@)
-build-so = $(CC) $(CFLAGS) -o $@ $^
+build-so = $(CC) $(CFLAGS) -o $@ $^ $(EXTRA_LIBS)
 q-build-so = $(call quiet, $(build-so), CC $@)
 adjust-deps = sed -i 's! $(subst .,\.,$<)\b! !g' $(@:.o=.d)
 q-adjust-deps = $(call very-quiet, $(adjust-deps))
@@ -219,6 +240,7 @@ boost-tests += tests/tst-bitset-iter.so
 boost-tests += tests/tst-timer-set.so
 boost-tests += tests/tst-clock.so
 boost-tests += tests/tst-rcu-hashtable.so
+boost-tests += tests/tst-unordered-ring-mpsc.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -261,6 +283,7 @@ tests += tests/misc-ctxsw.so
 tests += tests/tst-readdir.so
 tests += tests/tst-read.so
 tests += tests/tst-symlink.so
+tests += tests/tst-openat.so
 tests += tests/tst-eventfd.so
 tests += tests/tst-remove.so
 tests += tests/misc-wake.so
@@ -275,6 +298,7 @@ tests += tests/tst-tcp-nbwrite.so
 tests += tests/misc-tcp-hash-srv.so
 tests += tests/misc-loadbalance.so
 tests += tests/misc-scheduler.so
+tests += tests/misc-setpriority.so
 tests += tests/tst-dns-resolver.so
 tests += tests/tst-fs-link.so
 tests += tests/tst-kill.so
@@ -311,13 +335,18 @@ tests += tests/misc-free-perf.so
 tests += tests/tst-fallocate.so
 tests += tests/misc-printf.so
 tests += tests/tst-hostname.so
+tests += tests/tst-sendfile.so
 tests += tests/libstatic-thread-variable.so tests/tst-static-thread-variable.so
 tests/tst-static-thread-variable.so: tests/libstatic-thread-variable.so
-tests/tst-static-thread-variable.so: COMMON += -L./tests -lstatic-thread-variable
+tests/tst-static-thread-variable.so: private COMMON += -L./tests -lstatic-thread-variable
 tests += tests/misc-lock-perf.so
 tests += tests/tst-uio.so
 tests += tests/tst-printf.so
 tests += tests/tst-pthread-affinity.so
+tests += tests/tst-pthread-tsd.so
+tests += tests/tst-thread-local.so
+tests += tests/tst-seek.so
+tests += tests/tst-app.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -345,9 +374,23 @@ tools += tools/mkfs/mkfs.so
 tools += tools/cpiod/cpiod.so
 tools += tools/uush/uush.so
 
+tools += tools/libtools.so
+
+tools/route/lsroute.so: EXTRA_LIBS = -Ltools/ -ltools
+
+tools/ifconfig/ifconfig.so: EXTRA_LIBS = -Ltools/ -ltools
+
 ifeq ($(arch),aarch64)
+# note that the bootfs.manifest entry for the uush image
+# has no effect on the loader image, only on the usr image.
+# The only thing that does have an effect is the
+# bootfs.manifest.skel.
+#
+# Therefore, you need to manually add tests/tst-hello.so
+# to the bootfs.manifest.skel atm to get it to work.
+#
 tools += tests/tst-hello.so
-cmdline = tests/tst-hello.so
+cmdline = --nomount tests/tst-hello.so
 endif
 
 ifeq ($(arch),x64)
@@ -439,7 +482,8 @@ include $(src)/bsd/cddl/contrib/opensolaris/lib/libzfs/common/build.mk
 include $(src)/bsd/cddl/contrib/opensolaris/cmd/zpool/build.mk
 include $(src)/bsd/cddl/contrib/opensolaris/cmd/zfs/build.mk
 
-bsd  = bsd/net.o  
+bsd  = bsd/init.o
+bsd += bsd/net.o
 bsd += bsd/$(arch)/machine/in_cksum.o
 bsd += bsd/sys/crypto/rijndael/rijndael-alg-fst.o
 bsd += bsd/sys/crypto/rijndael/rijndael-api.o
@@ -496,6 +540,7 @@ bsd += bsd/sys/net/if_clone.o
 bsd += bsd/sys/net/if_loop.o  
 bsd += bsd/sys/net/if.o  
 bsd += bsd/sys/net/pfil.o  
+bsd += bsd/sys/net/routecache.o
 bsd += bsd/sys/netinet/in.o
 bsd += bsd/sys/netinet/in_pcb.o
 bsd += bsd/sys/netinet/in_proto.o
@@ -513,7 +558,6 @@ bsd += bsd/sys/netinet/tcp_debug.o
 bsd += bsd/sys/netinet/tcp_hostcache.o
 bsd += bsd/sys/netinet/tcp_input.o
 bsd += bsd/sys/netinet/tcp_lro.o
-bsd += bsd/sys/netinet/tcp_offload.o
 bsd += bsd/sys/netinet/tcp_output.o
 bsd += bsd/sys/netinet/tcp_reass.o
 bsd += bsd/sys/netinet/tcp_sack.o
@@ -526,6 +570,7 @@ bsd += bsd/sys/netinet/cc/cc.o
 bsd += bsd/sys/netinet/cc/cc_cubic.o
 bsd += bsd/sys/netinet/cc/cc_htcp.o
 bsd += bsd/sys/netinet/cc/cc_newreno.o
+bsd += bsd/sys/netinet/arpcache.o
 bsd += bsd/sys/xdr/xdr.o
 bsd += bsd/sys/xdr/xdr_array.o
 bsd += bsd/sys/xdr/xdr_mem.o
@@ -779,6 +824,7 @@ objects += arch/$(arch)/mmu.o
 objects += arch/$(arch)/exceptions.o
 objects += arch/$(arch)/dump.o
 objects += arch/$(arch)/arch-elf.o
+objects += arch/$(arch)/cpuid.o
 
 ifeq ($(arch),aarch64)
 objects += arch/$(arch)/arm-clock.o
@@ -790,7 +836,6 @@ objects += arch/x64/arch-trace.o
 objects += arch/x64/ioapic.o
 objects += arch/x64/apic.o
 objects += arch/x64/apic-clock.o
-objects += arch/x64/cpuid.o
 objects += arch/x64/entry-xen.o
 objects += arch/x64/xen.o
 objects += arch/x64/xen_intr.o
@@ -835,12 +880,14 @@ objects += core/net_channel.o
 objects += core/demangle.o
 objects += core/async.o
 objects += core/net_trace.o
+objects += core/app.o
 
 include $(src)/fs/build.mk
 include $(src)/libc/build.mk
 
 objects += $(addprefix fs/, $(fs))
 objects += $(addprefix libc/, $(libc))
+objects += $(addprefix musl/src/, $(musl))
 
 ifeq ($(cxx_lib_env), host)
     libstdc++.a := $(shell $(CXX) -print-file-name=libstdc++.a)
@@ -868,7 +915,7 @@ ifeq ($(gcc_lib_env), host)
         $(error Error: libgcc_eh.a needs to be installed.)
     endif
 else
-    libgcc_s.a := $(shell find $(gccbase)/ -name libgcc.a |  grep -v /32/)
+    libgcc.a := $(shell find $(gccbase)/ -name libgcc.a |  grep -v /32/)
     libgcc_eh.a := $(shell find $(gccbase)/ -name libgcc_eh.a |  grep -v /32/)
 endif
 
@@ -893,7 +940,7 @@ loader.elf: arch/$(arch)/boot.o arch/$(arch)/loader.ld loader.o runtime.o $(driv
 		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags \
 	    $(filter-out %.bin, $(^:%.ld=-T %.ld)) \
 	    --whole-archive \
-	      $(libstdc++.a) $(libgcc_s.a) $(libgcc_eh.a) \
+	      $(libstdc++.a) $(libgcc.a) $(libgcc_eh.a) \
 	      $(boost-libs) \
 	    --no-whole-archive, \
 		LD $@)
@@ -950,6 +997,9 @@ tools/mkfs/mkfs.so: tools/mkfs/mkfs.o libzfs.so
 
 tools/cpiod/cpiod.so: tools/cpiod/cpiod.o tools/cpiod/cpio.o libzfs.so
 
+tools/libtools.so: tools/route/route_info.o tools/ifconfig/network_interface.o
+	 $(call quiet, $(CC) $(CFLAGS) -shared -o tools/libtools.so $^, LINK $@)
+
 runtime.o: gen/include/ctype-data.h
 
 gen/include/ctype-data.h: gen-ctype-data
@@ -984,9 +1034,9 @@ $(src)/modules/tests/usr.manifest: $(src)/build.mk
 ################################################################################
 
 .PHONY: process-modules
-process-modules: bootfs.manifest.skel usr.manifest.skel $(src)/modules/tests/usr.manifest $(java-targets)
-	cd module \
-	  && jdkbase=$(jdkbase) OSV_BASE=$(src) OSV_BUILD_PATH=$(out) MAKEFLAGS= $(src)/scripts/module.py build -c $(image)
+process-modules: tools/libtools.so bootfs.manifest.skel usr.manifest.skel $(src)/modules/tests/usr.manifest $(java-targets)
+	+cd module && jdkbase=$(jdkbase) OSV_BASE=$(src) OSV_BUILD_PATH=$(out) MAKEFLAGS= \
+	   $(src)/scripts/module.py  $(filter --jobserver-fds=% -j, $(MAKEFLAGS)) build -c $(modules)
 
 cmdline: process-modules
 bootfs.manifest: process-modules
@@ -995,3 +1045,4 @@ usr.manifest: process-modules
 -include $(shell find -name '*.d')
 
 .DELETE_ON_ERROR:
+.SECONDARY:

@@ -69,7 +69,6 @@
 #include <bsd/sys/netinet/tcp_timer.h>
 #include <bsd/sys/netinet/tcp_var.h>
 #include <bsd/sys/netinet/tcp_syncache.h>
-#include <bsd/sys/netinet/tcp_offload.h>
 #ifdef INET6
 #include <bsd/sys/netinet6/tcp6_var.h>
 #endif
@@ -93,6 +92,7 @@
 
 #include <machine/in_cksum.h>
 #include <bsd/sys/sys/md5.h>
+#include <bsd/sys/net/routecache.hh>
 
 VNET_DEFINE(int, tcp_mssdflt) = TCP_MSS;
 #ifdef INET6
@@ -249,18 +249,9 @@ static void
 tcp_zone_change(void *tag)
 {
 
-	uma_zone_set_max(V_tcbinfo.ipi_zone, maxsockets);
+	// FIXME: uma_zone_set_max(V_tcbinfo.ipi_zone, maxsockets);
 	uma_zone_set_max(V_tcpcb_zone, maxsockets);
 	tcp_tw_zone_change();
-}
-
-static int
-tcp_inpcb_init(void *mem, int size, int flags)
-{
-	struct inpcb *inp = (inpcb *)mem;
-
-	INP_LOCK_INIT(inp, "inp", "tcpinp");
-	return (0);
 }
 
 void
@@ -275,7 +266,6 @@ tcp_init(void)
 		hashsize = 512; /* safe default */
 	}
 	in_pcbinfo_init(&V_tcbinfo, "tcp", &V_tcb, hashsize, hashsize,
-	    "tcp_inpcb", tcp_inpcb_init, NULL, UMA_ZONE_NOFREE,
 	    IPI_HASHFIELDS_4TUPLE);
 
 	/*
@@ -741,7 +731,7 @@ tcp_ccalgounload(struct cc_algo *unload_algo)
 	VNET_LIST_RLOCK();
 	VNET_FOREACH(vnet_iter) {
 		CURVNET_SET(vnet_iter);
-		INP_INFO_RLOCK(&V_tcbinfo);
+		INP_INFO_WLOCK(&V_tcbinfo);
 		/*
 		 * New connections already part way through being initialised
 		 * with the CC algo we're removing will not race with this code
@@ -771,7 +761,7 @@ tcp_ccalgounload(struct cc_algo *unload_algo)
 			}
 			INP_UNLOCK(inp);
 		}
-		INP_INFO_RUNLOCK(&V_tcbinfo);
+		INP_INFO_WUNLOCK(&V_tcbinfo);
 		CURVNET_RESTORE();
 	}
 	VNET_LIST_RUNLOCK();
@@ -784,8 +774,7 @@ tcp_ccalgounload(struct cc_algo *unload_algo)
  * the specified error.  If connection is synchronized,
  * then send a RST to peer.
  */
-struct tcpcb *
-tcp_drop(struct tcpcb *tp, int errval)
+void tcp_drop_noclose(struct tcpcb *tp, int errval)
 {
 	struct socket *so = tp->t_inpcb->inp_socket;
 
@@ -794,14 +783,20 @@ tcp_drop(struct tcpcb *tp, int errval)
 
 	if (TCPS_HAVERCVDSYN(tp->get_state())) {
 		tp->set_state(TCPS_CLOSED);
-		(void) tcp_output_reset(tp);
+		(void) tcp_output(tp);
 		TCPSTAT_INC(tcps_drops);
 	} else
 		TCPSTAT_INC(tcps_conndrops);
 	if (errval == ETIMEDOUT && tp->t_softerror)
 		errval = tp->t_softerror;
 	so->so_error = errval;
-	return (tcp_close(tp));
+}
+
+struct tcpcb *
+tcp_drop(struct tcpcb *tp, int errval)
+{
+	tcp_drop_noclose(tp, errval);
+	return tcp_close(tp);
 }
 
 void
@@ -877,8 +872,6 @@ tcp_discardcb(struct tcpcb *tp)
 
 	/* free the reassembly queue, if any */
 	tcp_reass_flush(tp);
-	/* Disconnect offload device, if any. */
-	tcp_offload_detach(tp);
 		
 	tcp_free_sackholes(tp);
 
@@ -927,9 +920,6 @@ tcp_close(struct tcpcb *tp)
 	INP_INFO_WLOCK_ASSERT(&V_tcbinfo);
 	INP_LOCK_ASSERT(inp);
 
-	/* Notify any offload devices of listener close */
-	if (tp->get_state() == TCPS_LISTEN)
-		tcp_offload_listen_close(tp);
 	in_pcbdrop(inp);
 	TCPSTAT_INC(tcps_closed);
 	KASSERT(inp->inp_socket != NULL, ("tcp_close: inp_socket NULL"));
@@ -971,7 +961,7 @@ tcp_drain(void)
 	 *	where we're really low on mbufs, this is potentially
 	 *	usefull.
 	 */
-		INP_INFO_RLOCK(&V_tcbinfo);
+		INP_INFO_WLOCK(&V_tcbinfo);
 		LIST_FOREACH(inpb, V_tcbinfo.ipi_listhead, inp_list) {
 			if (inpb->inp_flags & INP_TIMEWAIT)
 				continue;
@@ -982,7 +972,7 @@ tcp_drain(void)
 			}
 			INP_UNLOCK(inpb);
 		}
-		INP_INFO_RUNLOCK(&V_tcbinfo);
+		INP_INFO_WUNLOCK(&V_tcbinfo);
 		CURVNET_RESTORE();
 	}
 	VNET_LIST_RUNLOCK_NOSLEEP();
@@ -1669,7 +1659,7 @@ tcp_mtudisc(struct inpcb *inp, int mtuoffer)
 	tp->snd_recover = tp->snd_max;
 	if (tp->t_flags & TF_SACK_PERMIT)
 		EXIT_FASTRECOVERY(tp->t_flags);
-	tcp_output_send(tp);
+	tcp_output(tp);
 	return (inp);
 }
 
@@ -1684,6 +1674,7 @@ u_long
 tcp_maxmtu(struct in_conninfo *inc, int *flags)
 {
 	struct route sro;
+	struct rtentry rte_one;
 	struct bsd_sockaddr_in *dst;
 	struct ifnet *ifp;
 	u_long maxmtu = 0;
@@ -1696,7 +1687,8 @@ tcp_maxmtu(struct in_conninfo *inc, int *flags)
 		dst->sin_family = AF_INET;
 		dst->sin_len = sizeof(*dst);
 		dst->sin_addr = inc->inc_faddr;
-		in_rtalloc_ign(&sro, 0, inc->inc_fibnum);
+		route_cache::lookup(dst, inc->inc_fibnum, &rte_one);
+		sro.ro_rt = &rte_one;
 	}
 	if (sro.ro_rt != NULL) {
 		ifp = sro.ro_rt->rt_ifp;
@@ -1711,7 +1703,6 @@ tcp_maxmtu(struct in_conninfo *inc, int *flags)
 			    ifp->if_hwassist & CSUM_TSO)
 				*flags |= CSUM_TSO;
 		}
-		RTFREE(sro.ro_rt);
 	}
 	return (maxmtu);
 }

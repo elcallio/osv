@@ -142,7 +142,7 @@ class Connect(gdb.Command):
         status_enum.waiting = gdb.parse_and_eval('sched::thread::waiting')
         status_enum.queued = gdb.parse_and_eval('sched::thread::queued')
         status_enum.waking = gdb.parse_and_eval('sched::thread::waking')
-        
+
 
 Connect()
 
@@ -167,23 +167,48 @@ LogTrace()
 # for range in free_page_ranges():
 #     pass
 #
-def free_page_ranges(node = None):
-    if (node == None):
-        fpr = gdb.lookup_global_symbol('memory::free_page_ranges').value()
-        p = fpr['tree_']['data_']['node_plus_pred_']
-        node = p['header_plus_size_']['header_']['parent_']
-    
-    if node:
-        page_range = node.cast(gdb.lookup_type('void').pointer()) - 8
-        page_range = page_range.cast(gdb.lookup_type('memory::page_range').pointer())
-        
-        for x in free_page_ranges(node['left_']):
-            yield x
-            
-        yield page_range
-        
-        for x in free_page_ranges(node['right_']):
-            yield x
+def free_page_ranges():
+    pr_type = gdb.lookup_type('memory::page_range')
+    tree_offset = pr_type['set_hook'].bitpos >> 3
+    list_offset = pr_type['list_hook'].bitpos >> 3
+
+    def free_page_ranges_tree(node):
+        if node:
+            page_range = node.cast(gdb.lookup_type('void').pointer()) - tree_offset
+            page_range = page_range.cast(gdb.lookup_type('memory::page_range').pointer())
+
+            for x in free_page_ranges_tree(node['left_']):
+                yield x
+
+            yield page_range
+
+            for x in free_page_ranges_tree(node['right_']):
+                yield x
+
+    fpr = gdb.lookup_global_symbol('memory::free_page_ranges').value()
+    p = fpr['_free_huge']['tree_']['data_']['node_plus_pred_']
+    node = p['header_plus_size_']['header_']['parent_']
+    for x in free_page_ranges_tree(node):
+        yield x
+
+    for i in range(0, 16):
+        free_list = fpr['_free'][i]
+        node = free_list['data_']['root_plus_size_']['root_']
+        first_addr = node.cast(gdb.lookup_type('void').pointer())
+
+        if first_addr == free_list.address:
+            continue
+
+        while True:
+            page_range = node.cast(gdb.lookup_type('void').pointer()) - list_offset
+            page_range = page_range.cast(gdb.lookup_type('memory::page_range').pointer())
+
+            yield page_range
+
+            node = node['next_']
+            addr = node.cast(gdb.lookup_type('void').pointer())
+            if addr == first_addr:
+                break
 
 def vma_list(node = None):
     if (node == None):
@@ -222,9 +247,7 @@ class osv_memory(gdb.Command):
         gdb.Command.__init__(self, 'osv memory',
                              gdb.COMMAND_USER, gdb.COMPLETE_NONE)
     def invoke(self, arg, from_tty):
-        freemem = 0
-        for page_range in free_page_ranges():
-            freemem += int(page_range['size'])
+        freemem = gdb.parse_and_eval('memory::free_memory')['_M_i']
 
         mmapmem = 0
         for vma in vma_list():
@@ -232,13 +255,13 @@ class osv_memory(gdb.Command):
             end   = ulong(vma['_range']['_end'])
             size  = ulong(end - start)
             mmapmem += size
-            
+
         memsize = gdb.parse_and_eval('memory::phys_mem_size')
-        
+
         print ("Total Memory: %d Bytes" % memsize)
         print ("Mmap Memory:  %d Bytes (%.2f%%)" %
                (mmapmem, (mmapmem*100.0/memsize)))
-        print ("Free Memory:  %d Bytes (%.2f%%)" % 
+        print ("Free Memory:  %d Bytes (%.2f%%)" %
                (freemem, (freemem*100.0/memsize)))
 
 class osv_waiters(gdb.Command):
@@ -296,7 +319,7 @@ class osv_zfs(gdb.Command):
             # Shift to inflate low size I/O request
             vdev_cache_bshift = gdb.parse_and_eval('zfs_vdev_cache_bshift')
 
-            print (":: VDEV SETTINGS ::")
+            print ("\n:: VDEV SETTINGS ::")
             print ("\tvdev_cache_max:    %d" % vdev_cache_max)
             print ("\tvdev_cache_size:   %d" % vdev_cache_size)
             print ("\tvdev_cache_bshift: %d" % vdev_cache_bshift)
@@ -309,9 +332,9 @@ class osv_zfs(gdb.Command):
             vdev_hits = get_stat_by_name(vdc_stats_struct, vdc_stats_cast, 'vdc_stat_hits')
             vdev_misses = get_stat_by_name(vdc_stats_struct, vdc_stats_cast, 'vdc_stat_misses')
 
-            print ("\t\tvdev_cache_delegations:  %d" % vdev_delegations)
-            print ("\t\tvdev_cache_hits:         %d" % vdev_hits)
-            print ("\t\tvdev_cache_misses:       %d" % vdev_misses)
+            print ("\t\tvdev_cache_delegations: %d" % vdev_delegations)
+            print ("\t\tvdev_cache_hits:        %d" % vdev_hits)
+            print ("\t\tvdev_cache_misses:      %d" % vdev_misses)
 
         # Get address of 'struct arc_stats arc_stats'
         arc_stats_struct = int(gdb.parse_and_eval('(u64) &arc_stats'))
@@ -328,58 +351,120 @@ class osv_zfs(gdb.Command):
         arc_mru_perc = 100 * (float(arc_mru_size) / arc_target_size)
         arc_mfu_perc = 100 * (float(arc_mfu_size) / arc_target_size)
 
-        print (":: ARC SIZES ::")
-        print ("\tActual ARC Size:        %d" % arc_size)
-        print ("\tTarget size of ARC:     %d" % arc_target_size)
-        print ("\tMin Target size of ARC: %d" % arc_min_size)
-        print ("\tMax Target size of ARC: %d" % arc_max_size)
-        print ("\t\tMost Recently Used (MRU) size:   %d (%.2f%%)" %
-               (arc_mru_size, arc_mru_perc))
-        print ("\t\tMost Frequently Used (MFU) size: %d (%.2f%%)" %
-               (arc_mfu_size, arc_mfu_perc))
+        print ("\n:: ARC SIZES ::")
+        print ("\tCurrent size:    %d (%d MB)" %
+               (arc_size, arc_size / 1024 / 1024))
+        print ("\tTarget size:     %d (%d MB)" %
+               (arc_target_size, arc_target_size / 1024 / 1024))
+        print ("\tMin target size: %d (%d MB)" %
+               (arc_min_size, arc_min_size / 1024 / 1024))
+        print ("\tMax target size: %d (%d MB)" %
+               (arc_max_size, arc_max_size / 1024 / 1024))
 
-        # Cache hits/misses
+        print ("\n:: ARC SIZE BREAKDOWN ::")
+        print ("\tMost recently used cache size:   %d (%d MB) (%.2f%%)" %
+               (arc_mru_size, arc_mru_size / 1024 / 1024, arc_mru_perc))
+        print ("\tMost frequently used cache size: %d (%d MB) (%.2f%%)" %
+               (arc_mfu_size, arc_mfu_size / 1024 / 1024, arc_mfu_perc))
+
+        # Cache efficiency
         arc_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_hits')
         arc_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_misses')
-        arc_ac_total = arc_hits + arc_misses;
-        arc_hits_perc = 100 * (float(arc_hits) / arc_ac_total);
-        arc_misses_perc = 100 * (float(arc_misses) / arc_ac_total);
+        arc_ac_total = arc_hits + arc_misses
 
-        print (":: ARC EFFICIENCY ::")
-        print ("Total ARC accesses: %d" % arc_ac_total)
-        print ("\tARC hits: %d (%.2f%%)" %
-               (arc_hits, arc_hits_perc))
+        arc_hits_perc = 100 * (float(arc_hits) / arc_ac_total)
+        arc_misses_perc = 100 * (float(arc_misses) / arc_ac_total)
 
         arc_mru_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_mru_hits')
         arc_mru_ghost_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_mru_ghost_hits')
-        arc_mru_hits_perc = 100 * (float(arc_mru_hits) / arc_hits);
-
-        print ("\t\tARC MRU hits: %d (%.2f%%)" %
-               (arc_mru_hits, arc_mru_hits_perc))
-        print ("\t\t\tGhost Hits: %d" % arc_mru_ghost_hits)
-
         arc_mfu_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_mfu_hits')
         arc_mfu_ghost_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_mfu_ghost_hits')
-        arc_mfu_hits_perc = 100 * (float(arc_mfu_hits) / arc_hits);
+        arc_anon_hits = arc_hits - (arc_mru_hits + arc_mru_ghost_hits + arc_mfu_hits + arc_mfu_ghost_hits)
 
-        print ("\t\tARC MFU hits: %d (%.2f%%)" %
-               (arc_mfu_hits, arc_mfu_hits_perc))
-        print ("\t\t\tGhost Hits: %d" % arc_mfu_ghost_hits)
+        arc_mru_hits_perc = 100 * (float(arc_mru_hits) / arc_hits)
+        arc_mru_ghost_hits_perc = 100 * (float(arc_mru_ghost_hits) / arc_hits)
+        arc_mfu_hits_perc = 100 * (float(arc_mfu_hits) / arc_hits)
+        arc_mfu_ghost_hits_perc = 100 * (float(arc_mfu_ghost_hits) / arc_hits)
+        arc_anon_hits_perc = 100 * (float(arc_anon_hits) / arc_hits)
 
-        print ("\tARC misses: %d (%.2f%%)" %
-               (arc_misses, arc_misses_perc))
+        arc_real_hits = arc_mru_hits + arc_mfu_hits
+        arc_real_hits_perc = 100 * (float(arc_real_hits) / arc_ac_total)
 
-        # Streaming ratio
+        demand_data_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_demand_data_hits')
+        demand_metadata_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_demand_metadata_hits')
         prefetch_data_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_data_hits')
-        prefetch_data_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_data_misses')
         prefetch_metadata_hits = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_metadata_hits')
-        prefetch_metadata_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_metadata_misses')
-        prefetch_total = float(prefetch_data_hits + prefetch_data_misses + prefetch_metadata_hits + prefetch_metadata_misses)
 
-        print ("Prefetch workload ratio: %.4f%%" % (prefetch_total / arc_ac_total))
-        print ("Prefetch total:          %d" % prefetch_total)
-        print ("\tPrefetch hits:   %d" % (prefetch_data_hits + prefetch_metadata_hits))
-        print ("\tPrefetch misses: %d" % (prefetch_data_misses + prefetch_metadata_misses))
+        demand_data_hits_perc = 100 * (float(demand_data_hits) / arc_hits)
+        demand_metadata_hits_perc = 100 * (float(demand_metadata_hits) / arc_hits)
+        prefetch_data_hits_perc = 100 * (float(prefetch_data_hits) / arc_hits)
+        prefetch_metadata_hits_perc = 100 * (float(prefetch_metadata_hits) / arc_hits)
+
+        demand_data_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_demand_data_misses')
+        demand_metadata_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_demand_metadata_misses')
+        prefetch_data_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_data_misses')
+        prefetch_metadata_misses = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_prefetch_metadata_misses')
+
+        demand_data_misses_perc = 100 * (float(demand_data_misses) / arc_misses)
+        demand_metadata_misses_perc = 100 * (float(demand_metadata_misses) / arc_misses)
+        prefetch_data_misses_perc = 100 * (float(prefetch_data_misses) / arc_misses)
+        prefetch_metadata_misses_perc = 100 * (float(prefetch_metadata_misses) / arc_misses)
+
+        prefetch_data_total = (prefetch_data_hits + prefetch_data_misses)
+        prefetch_data_perc = 0
+        if prefetch_data_total > 0:
+            prefetch_data_perc = 100 * (float(prefetch_data_hits) / prefetch_data_total)
+
+        demand_data_total = (demand_data_hits + demand_data_misses)
+        demand_data_perc = 100 * (float(demand_data_hits) / demand_data_total)
+
+        print ("\n:: ARC EFFICIENCY ::")
+        print ("\tCache access total:  %d" %
+               arc_ac_total)
+        print ("\tCache hit ratio:     %d (%.2f%%)" %
+               (arc_hits, arc_hits_perc))
+        print ("\tCache miss ratio:    %d (%.2f%%)" %
+               (arc_misses, arc_misses_perc))
+        print ("\tREAL hit ratio:      %d (%.2f%%)" %
+               (arc_real_hits, arc_real_hits_perc))
+
+        print ("\n\tData demand efficiency:   %.2f%%" %
+               demand_data_perc)
+        if prefetch_data_total == 0:
+            print ("\tData prefetch efficiency: DISABLED")
+        else:
+            print ("\tData prefetch efficiency: %.2f%%" %
+                   prefetch_data_perc)
+
+        print ("\n:: CACHE HITS BY CACHE LIST ::")
+        print ("\tMost recently used:           %d (%.2f%%)" %
+               (arc_mru_hits, arc_mru_hits_perc))
+        print ("\tMost frequently used:         %d (%.2f%%)" %
+               (arc_mfu_hits, arc_mfu_hits_perc))
+        print ("\tMost recently used (Ghost):   %d (%.2f%%)" %
+               (arc_mru_ghost_hits, arc_mru_ghost_hits_perc))
+        print ("\tMost frequently used (Ghost): %d (%.2f%%)" %
+               (arc_mfu_ghost_hits, arc_mfu_ghost_hits_perc))
+
+        print ("\n:: CACHE HITS BY DATA TYPE ::")
+        print ("\tDemand data:       %d (%.2f%%)" %
+               (demand_data_hits, demand_data_hits_perc))
+        print ("\tPrefetch data:     %d (%.2f%%)" %
+               (prefetch_data_hits, prefetch_data_hits_perc))
+        print ("\tDemand metadata:   %d (%.2f%%)" %
+               (demand_metadata_hits, demand_metadata_hits_perc))
+        print ("\tPrefetch metadata: %d (%.2f%%)" %
+               (prefetch_metadata_hits, prefetch_metadata_hits_perc))
+
+        print ("\n:: CACHE MISSES BY DATA TYPE ::")
+        print ("\tDemand data:       %d (%.2f%%)" %
+               (demand_data_misses, demand_data_misses_perc))
+        print ("\tPrefetch data:     %d (%.2f%%)" %
+               (prefetch_data_misses, prefetch_data_misses_perc))
+        print ("\tDemand metadata:   %d (%.2f%%)" %
+               (demand_metadata_misses, demand_metadata_misses_perc))
+        print ("\tPrefetch metadata: %d (%.2f%%)" %
+               (prefetch_metadata_misses, prefetch_metadata_misses_perc))
 
         # Hash data
         arc_hash_elements = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_hash_elements')
@@ -387,10 +472,11 @@ class osv_zfs(gdb.Command):
         arc_hash_collisions = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_hash_collisions')
         arc_hash_chains = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_hash_chains')
 
-        print ("Total Hash elements: %d" % arc_hash_elements)
-        print ("\tMax Hash elements: %d" % arc_max_hash_elements)
-        print ("\tHash collisions:   %d" % arc_hash_collisions)
-        print ("\tHash chains:       %d" % arc_hash_chains)
+        print ("\n:: ARC HASH INFO ::")
+        print ("\tTotal hash elements: %d" % arc_hash_elements)
+        print ("\tMax hash elements:   %d" % arc_max_hash_elements)
+        print ("\tHash collisions:     %d" % arc_hash_collisions)
+        print ("\tHash chains:         %d" % arc_hash_chains)
 
         # L2ARC (not displayed if not supported)
         l2arc_size = get_stat_by_name(arc_stats_struct, arc_stats_cast, 'arcstat_l2_size')
@@ -402,22 +488,24 @@ class osv_zfs(gdb.Command):
             l2arc_hits_perc = 100 * (float(l2arc_hits) / l2arc_ac_total);
             l2arc_misses_perc = 100 * (float(l2arc_misses) / l2arc_ac_total);
 
-            print (":: L2ARC ::")
-            print ("\tActual L2ARC Size: %d" % l2arc_size)
-            print ("Total L2ARC accesses: %d" % l2arc_ac_total)
-            print ("\tL2ARC hits:   %d (%.2f%%)" %
+            print ("\n:: L2ARC ::")
+            print ("\tCurrent size:   %d" % l2arc_size)
+            print ("\tTotal accesses: %d" % l2arc_ac_total)
+            print ("\tCache hits:     %d (%.2f%%)" %
                    (l2arc_hits, l2arc_hits_perc))
-            print ("\tL2ARC misses: %d (%.2f%%)" %
+            print ("\tCache misses:   %d (%.2f%%)" %
                    (l2arc_misses, l2arc_misses_perc))
 
 def bits2str(bits, chars):
     r = ''
+    empty_str = 'none'
+    width = max(len(chars), len(empty_str))
     if bits == 0:
-        return 'none'.ljust(len(chars))
+        return empty_str.ljust(width)
     for i in range(len(chars)):
         if bits & (1 << i):
             r += chars[i]
-    return r.ljust(len(chars))
+    return r.ljust(width)
 
 def permstr(perm):
     return bits2str(perm, ['r', 'w', 'x'])
@@ -436,8 +524,16 @@ class osv_mmap(gdb.Command):
             flags =  flagstr(ulong(vma['_flags']))
             perm =  permstr(ulong(vma['_perm']))
             size  = '{:<16}'.format('[%s kB]' % (ulong(end - start)/1024))
-            print('0x%016x 0x%016x %s flags=%s perm=%s' % (start, end, size, flags, perm))
-    
+
+            if 'F' in flags:
+                file_vma = vma.cast(gdb.lookup_type('mmu::file_vma').pointer())
+                file_ptr = file_vma['_file']['px'].cast(gdb.lookup_type('file').pointer())
+                dentry_ptr = file_ptr['f_dentry']['px'].cast(gdb.lookup_type('dentry').pointer())
+                print('0x%016x 0x%016x %s flags=%s perm=%s offset=0x%08x path=%s'
+                        % (start, end, size, flags, perm, file_vma['_offset'], dentry_ptr['d_path'].string()))
+            else:
+                print('0x%016x 0x%016x %s flags=%s perm=%s' % (start, end, size, flags, perm))
+
 class osv_vma_find(gdb.Command):
     def __init__(self):
         gdb.Command.__init__(self, 'osv vma', gdb.COMMAND_USER, gdb.COMPLETE_NONE)
@@ -573,18 +669,30 @@ def derived_from(type, base_class):
 class unordered_map:
 
     def __init__(self, map_ref):
-        map_header = map_ref['_M_h']
-        map_type = map_header.type.strip_typedefs()
+        self.map_header = map_ref['_M_h']
+        map_type = self.map_header.type.strip_typedefs()
         self.node_type = gdb.lookup_type(str(map_type) +  '::__node_type').pointer()
-        self.begin = map_header['_M_bbegin']
+
+    def begin(self):
+        try:
+            return self.map_header['_M_bbegin']
+        except gdb.error:
+            return self.map_header['_M_before_begin']['_M_nxt']
+
+    def get_value(self, node):
+        try:
+            elem = node['_M_v']
+        except gdb.error:
+            storage = node['_M_storage']
+            elem = storage.address.cast(storage.type.template_argument(0).pointer()).dereference()
+        return elem['second']
 
     def __iter__(self):
-        begin = self.begin
-        while begin:
-            node = begin.cast(self.node_type).dereference()
-            elem = node["_M_v"]
-            yield elem["second"]
-            begin = node["_M_nxt"]
+        iterator = self.begin()
+        while iterator:
+            node = iterator.cast(self.node_type).dereference()
+            yield self.get_value(node)
+            iterator = node['_M_nxt']
 
 class intrusive_list:
     size_t = gdb.lookup_type('size_t')
@@ -814,34 +922,34 @@ class osv_info_callouts(gdb.Command):
     def invoke(self, arg, for_tty):
         c = str(gdb.lookup_global_symbol('callouts::_callouts').value())
         callouts = re.findall('\[([0-9]+)\] = (0x[0-9a-zA-Z]+)', c)
-        
+
         gdb.write("%-5s%-40s%-40s%-30s%-10s\n" % ("id", "addr", "function", "abs time (ns)", "flags"))
-        
+
         # We have a valid callout frame
         for desc in callouts:
             id = int(desc[0])
             addr = desc[1]
             callout = gdb.parse_and_eval('(struct callout *)' + addr)
             fname = callout['c_fn']
-            
+
             # time
             t = int(callout['c_to_ns'])
-            
+
             # flags
             CALLOUT_ACTIVE = 0x0002
             CALLOUT_PENDING = 0x0004
             CALLOUT_COMPLETED = 0x0020
             f = int(callout['c_flags'])
-            
+
             flags = ("0x%04x " % f) + \
                     ("A" if (callout['c_flags'] & CALLOUT_ACTIVE) else "") + \
                     ("P" if (callout['c_flags'] & CALLOUT_PENDING) else "") + \
                     ("C" if (callout['c_flags'] & CALLOUT_COMPLETED) else "")
-            
+
             # dispatch time ns  ticks callout function
             gdb.write("%-5d%-40s%-40s%-30s%-10s\n" %
                       (id, callout, fname, t, flags))
-                
+
 class osv_thread(gdb.Command):
     def __init__(self):
         gdb.Command.__init__(self, 'osv thread', gdb.COMMAND_USER,
@@ -1074,14 +1182,14 @@ def show_leak():
               len(allocs))
     gdb.flush();
     allocs.sort(key=lambda entry: entry[1])
-    
+
     import collections
     Record = collections.namedtuple('Record',
                                     ['bytes', 'allocations', 'minsize',
                                      'maxsize', 'avgsize', 'minbirth',
                                      'maxbirth', 'avgbirth', 'callchain'])
     records = [];
-    
+
     total_size = 0
     cur_n = 0
     cur_total_size = 0
@@ -1129,7 +1237,7 @@ def show_leak():
         cur_max_size = -1
         cur_min_size = -1
     gdb.write('generated %d records.\n' % len(records))
-        
+
     # Now sort the records by total number of bytes
     records.sort(key=lambda r: r.bytes, reverse=True)
 
@@ -1278,7 +1386,7 @@ class osv_runqueue(gdb.Command):
         gdb.Command.__init__(self, 'osv runqueue',
                              gdb.COMMAND_USER, gdb.COMPLETE_NONE)
     def invoke(self, arg, from_tty):
-        ncpus = gdb.parse_and_eval('sched::cpus._M_impl._M_finish - sched::cpus._M_impl._M_start');
+        ncpus = to_int(gdb.parse_and_eval('sched::cpus._M_impl._M_finish - sched::cpus._M_impl._M_start'))
         for cpu in range(ncpus) :
             gdb.write("CPU %d:\n" % cpu)
             for thread in runqueue(cpu):

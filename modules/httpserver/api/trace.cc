@@ -17,9 +17,13 @@
 #include <sys/stat.h>
 #include <osv/tracecontrol.hh>
 #include <osv/sampler.hh>
+#include <osv/trace-count.hh>
 
 using namespace httpserver::json;
 using namespace httpserver::json::trace_json;
+
+static std::unordered_map<tracepoint_base*,
+    std::unique_ptr<tracepoint_counter>> counters;
 
 /**
  * Initialize the routes object with specific routes mapping
@@ -56,52 +60,51 @@ void httpserver::api::trace::init(routes & routes)
 
     trace_json_init_path();
 
-    trace_json::getTraceEventStatus.set_handler("json", [](const_req req) {
+    trace_json::getTraceEventStatus.set_handler([](const_req req) {
         std::vector<jstrace_event_info> res;
         for (auto & e : ::trace::get_event_info(matcher(req))) {
             res.emplace_back(e);
         }
-        return formatter::to_json(res);
+        return res;
     });
-    trace_json::setTraceEventStatus.set_handler("json", [](const_req req) {
+    trace_json::setTraceEventStatus.set_handler([](const_req req) {
         std::vector<jstrace_event_info> res;
         const auto enabled = str2bool(req.get_query_param("enabled"));
         const auto backtrace = str2bool(req.get_query_param("backtrace"));
         for (auto & e : ::trace::set_event_state(matcher(req), enabled, backtrace)) {
             res.emplace_back(e);
         }
-        return formatter::to_json(res);
+        return res;
     });
-    trace_json::getSingleTraceEventStatus.set_handler("json", [](const_req req) {
+    trace_json::getSingleTraceEventStatus.set_handler([](const_req req) {
         const auto eventid = req.param.at("eventid").substr(1);
         const auto e = ::trace::get_event_info(eventid);
-        return formatter::to_json(jstrace_event_info(e));
+        return jstrace_event_info(e);
     });
-    trace_json::setSingleTraceEventStatus.set_handler("json", [](const_req req) {
+    trace_json::setSingleTraceEventStatus.set_handler([](const_req req) {
         const auto eventid = req.param.at("eventid").substr(1);
         const auto enabled = str2bool(req.get_query_param("enabled"));
         const auto backtrace = str2bool(req.get_query_param("backtrace"));
         const auto e = ::trace::set_event_state(eventid, enabled, backtrace);
-        return formatter::to_json(jstrace_event_info(e));
+        return jstrace_event_info(e);
     });
 
-    trace_json::setSamplerState.set_handler("json", [](const_req req, http::server::reply& rep) {
+    trace_json::setSamplerState.set_handler([](const_req req) {
         auto freq = std::stoi(req.get_query_param("freq"));
         if (freq == 0) {
             prof::stop_sampler();
-            return formatter::to_json("Sampler stopped successfully");
+            return "Sampler stopped successfully";
         }
 
         const int max_frequency = 100000;
         if (freq > max_frequency) {
-            rep.status = http::server::reply::status_type::bad_request;
-            return formatter::to_json("Frequency too large. Maximum is " + std::to_string(max_frequency));
+            throw bad_request_exception("Frequency too large. Maximum is " + std::to_string(max_frequency));
         }
 
         prof::config config;
         config.period = std::chrono::nanoseconds(1000000000 / freq);
         prof::start_sampler(config);
-        return formatter::to_json("Sampler started successfully");
+        return "Sampler started successfully";
     });
 
     class create_trace_dump_file {
@@ -149,4 +152,42 @@ void httpserver::api::trace::init(routes & routes)
     };
 
     trace_json::getTraceBuffers.set_handler(new create_trace_dump());
+
+    trace_json::setCountEvent.set_handler([](const_req req) {
+        const auto eventid = req.param.at("eventid").substr(1);
+        const auto enabled = str2bool(req.get_query_param("enabled"));
+        bool found = false;
+        for (auto & tp : tracepoint_base::tp_list) {
+            if (eventid == std::string(tp.name)) {
+                if (enabled) {
+                    counters[&tp] = std::unique_ptr<tracepoint_counter>(
+                            new tracepoint_counter(tp));
+                } else {
+                    counters.erase(&tp);
+                }
+                found = true;
+            }
+        }
+        if (!found) {
+            throw bad_request_exception("Unknown tracepoint name");
+        }
+        return "";
+    });
+    trace_json::getCounts.set_handler([](const_req req) {
+        httpserver::json::TraceCounts ret;
+        ret.time_ms = std::chrono::duration_cast<std::chrono::milliseconds>
+            (osv::clock::uptime::now().time_since_epoch()).count();
+        for (auto &it : counters) {
+            TraceCount c;
+            c.name = it.first->name;
+            c.count = it.second->read();
+            ret.list.push(c);
+        }
+        return ret;
+    });
+    trace_json::deleteCounts.set_handler([](const_req req) {
+        counters.clear();
+        return "";
+    });
+
 }

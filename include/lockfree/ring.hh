@@ -28,7 +28,8 @@ public:
         static_assert(is_power_of_two(MaxSize), "size must be a power of two");
     }
 
-    bool push(const T& element)
+    template<typename... Args>
+    inline bool emplace(Args&&... args)
     {
         unsigned end = _end.load(std::memory_order_relaxed);
 
@@ -42,10 +43,15 @@ public:
             return false;
         }
 
-        _ring[end & MaxSizeMask] = element;
+        new (&_ring[end & MaxSizeMask]) T(std::forward<Args>(args)...);
         _end.store(end + 1, std::memory_order_release);
 
         return true;
+    }
+
+    bool push(const T& element)
+    {
+        return emplace(element);
     }
 
     bool pop(T& element)

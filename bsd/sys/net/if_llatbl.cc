@@ -95,6 +95,8 @@ llentry_free(struct llentry *lle)
 	IF_AFDATA_WLOCK_ASSERT(lle->lle_tbl->llt_ifp);
 	LLE_WLOCK_ASSERT(lle);
 
+	arp_cache_remove(lle);
+
 	/* XXX: guard against race with other llentry_free(). */
 	if (!(lle->la_flags & LLE_LINKED)) {
 		LLE_FREE_LOCKED(lle);
@@ -180,34 +182,6 @@ lltable_free(struct lltable *llt)
 
 	free(llt);
 }
-
-#if 0
-void
-lltable_drain(int af)
-{
-	struct lltable	*llt;
-	struct llentry	*lle;
-	register int i;
-
-	LLTABLE_RLOCK();
-	SLIST_FOREACH(llt, &V_lltables, llt_link) {
-		if (llt->llt_af != af)
-			continue;
-
-		for (i=0; i < LLTBL_HASHTBL_SIZE; i++) {
-			LIST_FOREACH(lle, &llt->lle_head[i], lle_next) {
-				LLE_WLOCK(lle);
-				if (lle->la_hold) {
-					m_freem(lle->la_hold);
-					lle->la_hold = NULL;
-				}
-				LLE_WUNLOCK(lle);
-			}
-		}
-	}
-	LLTABLE_RUNLOCK();
-}
-#endif
 
 void
 lltable_prefix_free(int af, struct bsd_sockaddr *prefix, struct bsd_sockaddr *mask,

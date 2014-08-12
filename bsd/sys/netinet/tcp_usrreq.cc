@@ -81,7 +81,6 @@
 #ifdef TCPDEBUG
 #include <bsd/sys/netinet/tcp_debug.h>
 #endif
-#include <bsd/sys/netinet/tcp_offload.h>
 
 #include <osv/poll.h>
 
@@ -141,6 +140,11 @@ tcp_usr_attach(struct socket *so, int proto, struct thread *td)
 		so->so_nc = tp->nc;
 		for (auto&& pl : so->fp->f_poll_list) {
 			so->so_nc->add_poller(*pl._req);
+		}
+		if (so->fp->f_epolls) {
+		    for (auto&& ep : *so->fp->f_epolls) {
+		        so->so_nc->add_epoll(ep);
+		    }
 		}
 	}
 out:
@@ -369,7 +373,6 @@ tcp_usr_listen(struct socket *so, int backlog, struct thread *td)
 	if (error == 0) {
 		tp->set_state(TCPS_LISTEN);
 		solisten_proto(so, backlog);
-		tcp_offload_listen_open(tp);
 	}
 	SOCK_UNLOCK(so);
 
@@ -459,7 +462,7 @@ tcp_usr_connect(struct socket *so, struct bsd_sockaddr *nam, struct thread *td)
 	TCPDEBUG1();
 	if ((error = tcp_connect(tp, nam, td)) != 0)
 		goto out;
-	error = tcp_output_connect(so, nam);
+	error = tcp_output(tp);
 out:
 	TCPDEBUG2(PRU_CONNECT);
 	INP_UNLOCK(inp);
@@ -580,13 +583,6 @@ out:
 /*
  * Accept a connection.  Essentially all the work is done at higher levels;
  * just return the address of the peer, storing through addr.
- *
- * The rationale for acquiring the tcbinfo lock here is somewhat complicated,
- * and is described in detail in the commit log entry for r175612.  Acquiring
- * it delays an accept(2) racing with sonewconn(), which inserts the socket
- * before the inpcb address/port fields are initialized.  A better fix would
- * prevent the socket from being placed in the listen queue until all fields
- * are fully initialized.
  */
 static int
 tcp_usr_accept(struct socket *so, struct bsd_sockaddr **nam)
@@ -603,7 +599,6 @@ tcp_usr_accept(struct socket *so, struct bsd_sockaddr **nam)
 
 	inp = sotoinpcb(so);
 	KASSERT(inp != NULL, ("tcp_usr_accept: inp == NULL"));
-	INP_INFO_RLOCK(&V_tcbinfo);
 	INP_LOCK(inp);
 	if (inp->inp_flags & (INP_TIMEWAIT | INP_DROPPED)) {
 		error = ECONNABORTED;
@@ -623,7 +618,6 @@ tcp_usr_accept(struct socket *so, struct bsd_sockaddr **nam)
 out:
 	TCPDEBUG2(PRU_ACCEPT);
 	INP_UNLOCK(inp);
-	INP_INFO_RUNLOCK(&V_tcbinfo);
 	if (error == 0)
 		*nam = in_sockaddr(port, &addr);
 	return error;
@@ -709,7 +703,7 @@ tcp_usr_shutdown(struct socket *so)
 	socantsendmore_locked(so);
 	tcp_usrclosed(tp);
 	if (!(inp->inp_flags & INP_DROPPED))
-		error = tcp_output_disconnect(tp);
+		error = tcp_output(tp);
 
 out:
 	TCPDEBUG2(PRU_SHUTDOWN);
@@ -739,7 +733,7 @@ tcp_usr_rcvd(struct socket *so, int flags)
 	}
 	tp = intotcpcb(inp);
 	TCPDEBUG1();
-	tcp_output_rcvd(tp);
+	tcp_output(tp);
 
 out:
 	TCPDEBUG2(PRU_RCVD);
@@ -835,7 +829,7 @@ tcp_usr_send(struct socket *so, int flags, struct mbuf *m,
 		if (!(inp->inp_flags & INP_DROPPED)) {
 			if (flags & PRUS_MORETOCOME)
 				tp->t_flags |= TF_MORETOCOME;
-			error = tcp_output_send(tp);
+			error = tcp_output(tp);
 			if (flags & PRUS_MORETOCOME)
 				tp->t_flags &= ~TF_MORETOCOME;
 		}
@@ -882,7 +876,7 @@ tcp_usr_send(struct socket *so, int flags, struct mbuf *m,
 		}
 		tp->snd_up = tp->snd_una + so->so_snd.sb_cc;
 		tp->t_flags |= TF_FORCEDATA;
-		error = tcp_output_send(tp);
+		error = tcp_output(tp);
 		tp->t_flags &= ~TF_FORCEDATA;
 	}
 out:
@@ -1605,12 +1599,7 @@ tcp_attach(struct socket *so)
 	so->so_rcv.sb_flags |= SB_AUTOSIZE;
 	so->so_snd.sb_flags |= SB_AUTOSIZE;
 	INP_INFO_WLOCK(&V_tcbinfo);
-	error = in_pcballoc(so, &V_tcbinfo);
-	if (error) {
-		INP_INFO_WUNLOCK(&V_tcbinfo);
-		return (error);
-	}
-	inp = sotoinpcb(so);
+	inp = new inpcb(so, &V_tcbinfo);
 #ifdef INET6
 	if (inp->inp_vflag & INP_IPV6PROTO) {
 		inp->inp_vflag |= INP_IPV6;
@@ -1666,7 +1655,7 @@ tcp_disconnect(struct tcpcb *tp)
 		sbflush(so, &so->so_rcv);
 		tcp_usrclosed(tp);
 		if (!(inp->inp_flags & INP_DROPPED))
-			tcp_output_disconnect(tp);
+			tcp_output(tp);
 	}
 }
 
@@ -1691,7 +1680,6 @@ tcp_usrclosed(struct tcpcb *tp)
 
 	switch (tp->get_state()) {
 	case TCPS_LISTEN:
-		tcp_offload_listen_close(tp);
 		/* FALLTHROUGH */
 	case TCPS_CLOSED:
 		tp->set_state(TCPS_CLOSED);

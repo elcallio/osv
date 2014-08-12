@@ -16,6 +16,10 @@ PARAM_VERSION="--override-version"
 PARAM_REGIONS="--override-regions"
 PARAM_SMALL="--small-instances"
 PARAM_MODULES="--modules-list"
+PARAM_REGION="--region"
+PARAM_ZONE="--zone"
+PARAM_PLACEMENT_GROUP="--placement-group"
+PARAM_IMAGE_SIZE="--image-size"
 
 MODULES_LIST=default
 
@@ -56,6 +60,10 @@ This script receives following command line arguments:
     $PARAM_REGIONS <regions list> - replicate to specified regions only
     $PARAM_SMALL - create AMI suitable for small and micro instances
     $PARAM_MODULES <modules list> - list of modules to build (incompatible with $PARAM_IMAGE and $PARAM_INSTANCE)
+    $PARAM_REGION <region> - AWS region to work in
+    $PARAM_ZONE <availability zone> - AWS availability zone to work in
+    $PARAM_PLACEMENT_GROUP <placement group> - Placement group for instances created by this script
+    $PARAM_IMAGE_SIZE <image size> - size of image to build (unit is MB)
 
 HLPEND
 }
@@ -93,6 +101,25 @@ do
       MODULES_LIST=$2
       shift 2
       ;;
+    "$PARAM_REGION")
+      AWS_DEFAULT_REGION=$2
+      shift 2
+      ;;
+    "$PARAM_ZONE")
+      OSV_AVAILABILITY_ZONE=$2
+      shift 2
+      ;;
+    "$PARAM_PLACEMENT_GROUP")
+      OSV_PLACEMENT_GROUP=$2
+      shift 2
+      ;;
+    "$PARAM_IMAGE_SIZE")
+      if [ $2 -ne "" ]
+      then
+        IMAGE_SIZE="fs_size_mb=$2"
+      fi
+      shift 2
+      ;;
     "$PARAM_HELP")
       print_help
       exit 0
@@ -116,22 +143,6 @@ OSV_BUCKET=osv-$OSV_VER-$USER-at-`hostname`-`timestamp`
 
 EC2_CREDENTIALS="-o $AWS_ACCESS_KEY_ID -w $AWS_SECRET_ACCESS_KEY"
 
-if test x"$SMALL_INSTANCE" = x""; then
-
-#Use OSv-v0.09 AMI in us-east-1 as a template
-#Linux based but suitable for large instances only
-TEMPLATE_AMI_ID=ami-d6f90fbe
-TEMPLATE_INSTANCE_TYPE=m3.medium
-
-else
-
-#Use OSv-v0.09-small AMI in us-east-1 as a template
-#Windows based but supportes all instance types including small and micro
-TEMPLATE_AMI_ID=ami-b4f80edc
-TEMPLATE_INSTANCE_TYPE=t1.micro
-
-fi
-
 amend_rstatus() {
  echo \[`timestamp`\] $* >> $OSV_RSTATUS
 }
@@ -148,21 +159,49 @@ echo_progress() {
 }
 
 import_osv_volume() {
- $EC2_HOME/bin/ec2-import-volume $OSV_VOLUME \
+ ec2-import-volume $OSV_VOLUME \
                                  -f raw \
                                  -b $OSV_BUCKET \
                                  -z `get_availability_zone` \
                                  $EC2_CREDENTIALS | tee /dev/tty | ec2_response_value IMPORTVOLUME TaskId
 }
 
+get_template_ami_id() {
+ if test x"$SMALL_INSTANCE" = x""; then
+  aws ec2 describe-images --filters='Name=name,Values=OSv-v*IPerf' | get_json_value '["Images"][0]["ImageId"]'
+ else
+  aws ec2 describe-images --filters='Name=name,Values=OSv-v*small' | get_json_value '["Images"][0]["ImageId"]'
+ fi
+}
+
+get_template_instance_type() {
+ if test x"$SMALL_INSTANCE" = x""; then
+  echo c3.large
+ else
+  echo t1.micro
+ fi
+}
+
 launch_template_instance() {
- $EC2_HOME/bin/ec2-run-instances $TEMPLATE_AMI_ID --availability-zone `get_availability_zone` --instance-type $TEMPLATE_INSTANCE_TYPE | tee /dev/tty | ec2_response_value INSTANCE INSTANCE
+ if test x"$OSV_PLACEMENT_GROUP" != x""; then
+  PLACEMENT="--placement-group $OSV_PLACEMENT_GROUP"
+ else
+  PLACEMENT=""
+ fi
+
+ local TEMPLATE_AMI_ID=$1
+ local TEMPLATE_INSTANCE_TYPE=$2
+
+ ec2-run-instances $TEMPLATE_AMI_ID --availability-zone `get_availability_zone` \
+                                                  --instance-type $TEMPLATE_INSTANCE_TYPE \
+                                                  $PLACEMENT \
+                                                  | tee /dev/tty | ec2_response_value INSTANCE INSTANCE
 }
 
 get_availability_zone() {
 
  if test x"$OSV_AVAILABILITY_ZONE" = x""; then
-     OSV_AVAILABILITY_ZONE=`$EC2_HOME/bin/ec2-describe-availability-zones | ec2_response_value AVAILABILITYZONE AVAILABILITYZONE | head -1`
+     OSV_AVAILABILITY_ZONE=`ec2-describe-availability-zones | ec2_response_value AVAILABILITYZONE AVAILABILITYZONE | head -1`
  fi
 
  echo $OSV_AVAILABILITY_ZONE
@@ -211,7 +250,7 @@ while true; do
 
     if test x"$DONT_BUILD" != x"1"; then
         echo_progress Building from the scratch
-        make clean && git submodule update && make external && make -j `nproc` img_format=raw image=$MODULES_LIST
+        make clean && git submodule update && make external && make -j `nproc` $IMAGE_SIZE img_format=raw image=$MODULES_LIST
 
         if test x"$?" != x"0"; then
             handle_error Build failed.
@@ -261,13 +300,17 @@ while true; do
     echo_progress Renaming newly created volume OSv-$OSV_VER
     rename_object $VOLUME_ID OSv-$OSV_VER
 
+    TEMPLATE_AMI_ID=`get_template_ami_id`
+    TEMPLATE_INSTANCE_TYPE=`get_template_instance_type`
+
     if test x"$?" != x"0"; then
         handle_error Failed to rename the new volume.
         break;
     fi
 
     echo_progress Creating new template instance from AMI $TEMPLATE_AMI_ID
-    INSTANCE_ID=`launch_template_instance`
+    echo_progress Region: $AWS_DEFAULT_REGION, Zone: $OSV_AVAILABILITY_ZONE, Group: $OSV_PLACEMENT_GROUP
+    INSTANCE_ID=`launch_template_instance $TEMPLATE_AMI_ID $TEMPLATE_INSTANCE_TYPE`
 
     if test x"$INSTANCE_ID" = x; then
         handle_error Failed to create template instance.

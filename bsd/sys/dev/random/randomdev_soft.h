@@ -48,11 +48,21 @@
  * buffer size is pretty arbitrary.
  */
 struct harvest {
+	harvest(uintmax_t somecounter, const void* src, u_int src_size, u_int bits, enum esource source)
+		: somecounter(somecounter)
+		, size(std::min(src_size, (u_int)HARVESTSIZE))
+		, bits(bits)
+		, source(source)
+	{
+		memcpy(entropy, src, size);
+	}
+
+	harvest() {}
+
 	uintmax_t somecounter;		/* fast counter for clock jitter */
 	uint8_t entropy[HARVESTSIZE];	/* the harvested entropy */
 	u_int size, bits;		/* stats about the entropy */
 	enum esource source;		/* origin of the entropy */
-	STAILQ_ENTRY(harvest) next;	/* next item on the list */
 };
 
 void randomdev_init(void);
@@ -62,7 +72,6 @@ void randomdev_init_harvester(void (*)(u_int64_t, const void *, u_int,
 	u_int, enum esource), int (*)(void *, int));
 void randomdev_deinit_harvester(void);
 
-void random_set_wakeup_exit(void *);
 void random_process_event(struct harvest *event);
 void randomdev_unblock(void);
 

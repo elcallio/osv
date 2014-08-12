@@ -9,6 +9,7 @@
 #include <sys/poll.h>
 #include <unistd.h>
 #include <errno.h>
+#include <osv/latch.hh>
 
 #include <string>
 #include <iostream>
@@ -22,6 +23,60 @@ static void report(bool ok, std::string msg)
     ++tests;
     fails += !ok;
     std::cout << (ok ? "PASS" : "FAIL") << ": " << msg << "\n";
+}
+
+static void write_one(int fd)
+{
+    char c;
+    int w = write(fd, &c, 1);
+    report(w == 1, "write");
+}
+
+static void test_epolloneshot()
+{
+    constexpr int MAXEVENTS = 1024;
+    struct epoll_event events[MAXEVENTS];
+
+    int ep = epoll_create(1);
+    report(ep >= 0, "epoll_create");
+
+    int s[2];
+    int r = pipe(s);
+    report(r == 0, "create pipe");
+
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLONESHOT;
+    event.data.u32 = 123;
+
+    r = epoll_ctl(ep, EPOLL_CTL_ADD, s[0], &event);
+    report(r == 0, "epoll_ctl ADD");
+
+    write_one(s[1]);
+
+    r = epoll_wait(ep, events, MAXEVENTS, 0);
+    report(r == 1, "epoll_wait");
+
+    write_one(s[1]);
+
+    // Test that new event is not delivered
+    r = epoll_wait(ep, events, MAXEVENTS, 0);
+    report(r == 0, "epoll_wait");
+
+    // Unblock the descriptor
+    r = epoll_ctl(ep, EPOLL_CTL_MOD, s[0], &event);
+    report(r == 0, "epoll_ctl MOD");
+
+    // The event should be ready now
+    r = epoll_wait(ep, events, MAXEVENTS, 0);
+    report(r == 1, "epoll_wait");
+
+    // Test that one-shotness does not remove the descriptor
+    r = epoll_ctl(ep, EPOLL_CTL_ADD, s[0], &event);
+    report(r == -1, "epoll_ctl ADD");
+    report(errno == EEXIST, "errno == EEXIST");
+
+    r = epoll_ctl(ep, EPOLL_CTL_DEL, s[0], &event);
+    report(r == 0, "epoll_ctl DEL");
 }
 
 int main(int ac, char** av)
@@ -99,6 +154,28 @@ int main(int ac, char** av)
             "epoll timeout");
 
     ////////////////////////////////////////////////////////////////////////////
+    event.events = EPOLLIN | EPOLLET;
+    r = epoll_ctl(ep, EPOLL_CTL_MOD, s[0], &event);
+    report(r == 0, "epoll_ctl_mod");
+
+    latch first_epoll_wait_returned;
+    std::thread t2([&] {
+        int r = epoll_wait(ep, events, MAXEVENTS, 5000);
+        report(r == 1, "epoll_wait in thread");
+        first_epoll_wait_returned.count_down();
+        r = epoll_wait(ep, events, MAXEVENTS, 5000);
+        report(r == 1, "epoll_wait in thread");
+        r = read(s[0], &c, 1);
+        report(r == 1, "read the last byte on the pipe");
+    });
+    r = write(s[1], &c, 1);
+    report(r == 1, "write single character");
+    first_epoll_wait_returned.await();
+    r = epoll_ctl(ep, EPOLL_CTL_MOD, s[0], &event);
+    report(r == 0, "epoll_ctl_mod");
+    t2.join();
+
+    ////////////////////////////////////////////////////////////////////////////
     // Test EPOLLET (edge-triggered event notification)
     // Also test EPOLL_CTL_MOD at the same time.
     event.events = EPOLLIN | EPOLLET;
@@ -151,8 +228,10 @@ int main(int ac, char** av)
     r = epoll_ctl(ep, EPOLL_CTL_ADD, s[0], &event);
     report(r == -1 && errno == EEXIST, "EEXIST");
 
+    test_epolloneshot();
 
     std::cout << "SUMMARY: " << tests << ", " << fails << " failures\n";
+    return !!fails;
 }
 
 

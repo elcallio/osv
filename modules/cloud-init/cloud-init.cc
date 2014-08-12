@@ -8,9 +8,11 @@
 #include "cloud-init.hh"
 #include <iostream>
 #include <fstream>
+#include <memory>
 #include "client.hh"
 #include <boost/asio.hpp>
-
+#include "data-source.hh"
+#include <osv/debug.hh>
 
 namespace init {
 using namespace std;
@@ -30,22 +32,9 @@ private:
     std::string msg;
 };
 
-void osvinit::load_file(const std::string& path, bool once)
+static std::string get_url(const std::string& server, const std::string& path,
+                       const std::string& port)
 {
-    if (mark(path) && once) {
-        return;
-    }
-    YAML::Node config = YAML::LoadFile(path);
-    do_yaml(config);
-}
-
-void osvinit::load_url(const std::string& server, const std::string& path,
-                       const std::string& port,
-                       bool once)
-{
-    if (mark(server + path) && once) {
-        return;
-    }
     client c;
     if (port == "") {
         c.get(server, path);
@@ -53,33 +42,77 @@ void osvinit::load_url(const std::string& server, const std::string& path,
         c.get(server, path, atoi(port.c_str()));
     }
 
-    boost::asio::streambuf buf;
-    std::iostream os(&buf);
-    os  << c;
+    if (!c.is_ok()) {
+        throw std::runtime_error("Request failed: " + c.get_status());
+    }
 
-    YAML::Node config = YAML::Load(os);
-    do_yaml(config);
+    return c.text();
 }
 
-/**
- * Wrap the run server command in the global server in a method
- * that can be passed to pthred_create
- */
-/*
-static void run_server()
-{
-    httpserver::global_server::run();
+static string get_user_data() {
+    auto& ds = get_data_source();
+    return ds.get_user_data();
 }
-*/
 
-void osvinit::wait()
+void include_module::load_file(const std::string& path)
 {
-    if (should_wait) {
-        t.join();
+    if (!mark(path)) {
+        init.load_file(path);
     }
 }
 
-static void yaml_to_request(const YAML::Node& node, http::server::request& req)
+void include_module::load_url(const YAML::Node& doc)
+{
+    if (!doc["path"]) {
+        throw osvinit_exception("missing path parameter in remote include");
+    }
+    if (!doc["server"]) {
+        throw osvinit_exception("missing server parameter in remote include");
+    }
+    std::string port = (doc["port"]) ? doc["port"].as<std::string>() : "";
+    std::string path = doc["path"].as<std::string>();
+    std::string server = doc["server"].as<std::string>();
+    if (!mark(server + path)) {
+        init.load_url(server, path, port);
+    }
+}
+
+std::string get_node_name(const YAML::detail::iterator_value& node) {
+    if (node.IsScalar()) {
+        return node.as<std::string>();
+    }
+    return node.begin()->first.as<std::string>();
+}
+
+void include_module::handle(const YAML::Node& doc)
+{
+    for (auto& node : doc) {
+        if (node.IsScalar()) {
+            if (node.as<std::string>() == "load-from-cloud") {
+                init.load_from_cloud();
+            } else {
+                throw osvinit_exception(
+                                        "unknown include "+ node.as<std::string>()+ " use: load-from-cloud, file or remote");
+            }
+        } else {
+            if (node["file"]) {
+                load_file(node["file"].as<std::string>());
+            } else if (node["remote"]) {
+                load_url(node["remote"]);
+            } else if (node["load-from-cloud"]) {
+                bool allow = node["load-from-cloud"].IsMap() &&  node["load-from-cloud"]["ignore-missing-source"] &&
+                        node["load-from-cloud"]["ignore-missing-source"].as<bool>();
+                init.load_from_cloud(allow);
+            } else {
+                throw osvinit_exception(
+                        "unknown include "+ get_node_name(node)+ " use: load-from-cloud, file or remote");
+            }
+        }
+    }
+}
+
+
+void script_module::yaml_to_request(const YAML::Node& node, http::server::request& req)
 {
     std::string method;
     for (auto i : node) {
@@ -106,42 +139,7 @@ static void yaml_to_request(const YAML::Node& node, http::server::request& req)
     req.uri = node[method].as<string>();
 }
 
-void osvinit::do_yaml(const YAML::Node& doc)
-{
-    for (YAML::const_iterator it = doc.begin(); it != doc.end(); ++it) {
-        try {
-            http::server::request req;
-            yaml_to_request(*it, req);
-            if (req.uri == "/include") {
-                do_include (req);
-            } else if (req.uri == "/open-rest-api") {
-                should_wait = true;
-                t = std::thread([=] { httpserver::global_server::run(); });
-            } else if (!req.uri.empty()) {
-                do_api(req);
-            }
-        } catch (const exception& e) {
-            cerr << "osvinit failed with error: " << e.what() << endl;
-            if (halt_on_error) {
-                return;
-            }
-        }
-
-    }
-}
-
-void osvinit::do_include(http::server::request& api)
-{
-    bool once = api.get_query_param("once")  == "True";
-    if (api.get_query_param("path") != "") {
-        load_file(api.get_query_param("path"), once);
-    } else {
-        load_url(api.get_query_param("host"), api.get_query_param("url"),
-                 api.get_query_param("port"), once);
-    }
-}
-
-void osvinit::do_api(http::server::request& req)
+void script_module::do_api(http::server::request& req)
 {
     http::server::reply rep;
 
@@ -149,6 +147,99 @@ void osvinit::do_api(http::server::request& req)
 
     if (rep.status != 200) {
         throw osvinit_exception(rep.content);
+    }
+}
+
+void script_module::handle(const YAML::Node& doc)
+{
+    for (auto& node : doc) {
+        http::server::request req;
+        yaml_to_request(node, req);
+        if (req.uri == "/open-rest-api") {
+            should_wait = true;
+            t = std::thread([=] {boost::program_options::variables_map c; httpserver::global_server::run(c); });
+        } else if (!req.uri.empty()) {
+            do_api(req);
+        }
+    }
+}
+
+void script_module::wait()
+{
+    if (should_wait) {
+        t.join();
+    }
+}
+
+void osvinit::add_module(std::shared_ptr<config_module> module)
+{
+    _modules[module->get_label()] = module;
+}
+
+void osvinit::load(const std::string& script)
+{
+    do_yaml(YAML::Load(script));
+}
+
+void osvinit::load_file(const std::string& path)
+{
+    do_yaml(YAML::LoadFile(path));
+}
+
+void osvinit::load_url(const std::string& server, const std::string& path,
+                       const std::string& port)
+{
+    load(get_url(server, path, port));
+}
+
+void osvinit::load_from_cloud(bool ignore_missing_source)
+{
+
+    std::string user_data;
+    try {
+        user_data = get_user_data();
+    } catch (const std::runtime_error& e) {
+        if (ignore_missing_source) {
+            return;
+        }
+        throw osvinit_exception("Failed getting cloud-init information "+std::string(e.what()));
+    }
+    if (user_data.empty()) {
+        debug("User data is empty\n");
+        return;
+    }
+
+    load(user_data);
+}
+
+
+/**
+ * Wrap the run server command in the global server in a method
+ * that can be passed to pthred_create
+ */
+/*
+static void run_server()
+{
+    httpserver::global_server::run();
+}
+*/
+
+void osvinit::do_yaml(const YAML::Node& doc)
+{
+    for (auto& node : doc) {
+        std::string label;
+        label = node.first.as<std::string>();
+        try {
+            if (!_modules.count(label)) {
+                throw std::runtime_error("Handler not found");
+            }
+            _modules[label]->handle(node.second);
+         } catch (const exception& e) {
+            cerr << "cloud-init failed when handling '" << label << "'': " << e.what() << endl;
+            if (halt_on_error) {
+                return;
+            }
+        }
     }
 }
 

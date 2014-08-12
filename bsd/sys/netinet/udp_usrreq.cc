@@ -143,18 +143,8 @@ static void
 udp_zone_change(void *tag)
 {
 
-	uma_zone_set_max(V_udbinfo.ipi_zone, maxsockets);
+	// FIXME: uma_zone_set_max(V_udbinfo.ipi_zone, maxsockets);
 	uma_zone_set_max(V_udpcb_zone, maxsockets);
-}
-
-static int
-udp_inpcb_init(void *mem, int size, int flags)
-{
-	struct inpcb *inp;
-
-	inp = (inpcb *)mem;
-	INP_LOCK_INIT(inp, "inp", "udpinp");
-	return (0);
 }
 
 void
@@ -162,7 +152,6 @@ udp_init(void)
 {
 
 	in_pcbinfo_init(&V_udbinfo, "udp", &V_udb, UDBHASHSIZE, UDBHASHSIZE,
-	    "udp_inpcb", udp_inpcb_init, NULL, UMA_ZONE_NOFREE,
 	    IPI_HASHFIELDS_2TUPLE);
 	V_udpcb_zone = uma_zcreate("udpcb", sizeof(struct udpcb),
 	    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, UMA_ZONE_NOFREE);
@@ -409,7 +398,7 @@ udp_input(struct mbuf *m, int off)
 		struct inpcb *last;
 		struct ip_moptions *imo;
 
-		INP_INFO_RLOCK(&V_udbinfo);
+		INP_INFO_WLOCK(&V_udbinfo);
 		last = NULL;
 		LIST_FOREACH(inp, &V_udb, inp_list) {
 			if (inp->inp_lport != uh->uh_dport)
@@ -497,12 +486,12 @@ udp_input(struct mbuf *m, int off)
 			UDPSTAT_INC(udps_noportbcast);
 			if (inp)
 				INP_UNLOCK(inp);
-			INP_INFO_RUNLOCK(&V_udbinfo);
+			INP_INFO_WUNLOCK(&V_udbinfo);
 			goto badunlocked;
 		}
 		udp_append(last, ip, m, iphlen, &udp_in);
 		INP_UNLOCK(last);
-		INP_INFO_RUNLOCK(&V_udbinfo);
+		INP_INFO_WUNLOCK(&V_udbinfo);
 		return;
 	}
 
@@ -1374,13 +1363,8 @@ udp_attach(struct socket *so, int proto, struct thread *td)
 	if (error)
 		return (error);
 	INP_INFO_WLOCK(&V_udbinfo);
-	error = in_pcballoc(so, &V_udbinfo);
-	if (error) {
-		INP_INFO_WUNLOCK(&V_udbinfo);
-		return (error);
-	}
+	inp = new inpcb(so, &V_udbinfo);
 
-	inp = sotoinpcb(so);
 	inp->inp_vflag |= INP_IPV4;
 	inp->inp_ip_ttl = V_ip_defttl;
 

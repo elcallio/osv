@@ -14,7 +14,7 @@ from operator import attrgetter
 from tests.testing import *
 
 blacklist = [
-    "tst-dns-resolver.so"
+    "tst-dns-resolver.so",
 ]
 
 add_tests([
@@ -31,7 +31,7 @@ test_files = set(glob.glob('build/release/tests/tst-*.so')) - set(glob.glob('bui
 add_tests((TestRunnerTest(os.path.basename(x)) for x in test_files))
 
 def run_test(test):
-    sys.stdout.write("  TEST %-25s" % test.name)
+    sys.stdout.write("  TEST %-35s" % test.name)
     sys.stdout.flush()
 
     start = time.time()
@@ -63,7 +63,7 @@ def run(tests):
         if is_not_skipped(test):
             run_test(test)
         else:
-            sys.stdout.write("  TEST %-25s SKIPPED\n" % test.name)
+            sys.stdout.write("  TEST %-35s SKIPPED\n" % test.name)
             sys.stdout.flush()
 
 def pluralize(word, count):
@@ -77,7 +77,7 @@ def run_tests():
     if cmdargs.test:
         test = next((t for t in tests if t.name == cmdargs.test), None)
         if not test:
-            print 'No such test: ' + cmdargs.test
+            print('No such test: ' + cmdargs.test)
             exit(1)
         tests_to_run = [test]
     else:
@@ -85,7 +85,7 @@ def run_tests():
 
     if cmdargs.single:
         if tests_to_run != tests:
-            print 'Cannot restrict the set of tests when --single option is used'
+            print('Cannot restrict the set of tests when --single option is used')
             exit(1)
         run_tests_in_single_instance()
     else:
@@ -94,7 +94,7 @@ def run_tests():
     end = time.time()
 
     duration = end - start
-    print("OK (%d %s run, %.3f s)" % (len(tests_to_run), pluralize("test", len(tests_to_run)), duration))
+    print(("OK (%d %s run, %.3f s)" % (len(tests_to_run), pluralize("test", len(tests_to_run)), duration)))
 
 def main():
     while True:

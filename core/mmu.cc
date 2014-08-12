@@ -832,7 +832,7 @@ uintptr_t find_hole(uintptr_t start, uintptr_t size)
     if (good_enough) {
         return good_enough;
     }
-    abort();
+    throw make_error(ENOMEM);
 }
 
 ulong evacuate(uintptr_t start, uintptr_t end)
@@ -1683,7 +1683,7 @@ int shm_file::stat(struct stat* buf)
 int shm_file::close()
 {
     for (auto& i : _pages) {
-        memory::free_page(i.second);
+        memory::free_huge_page(i.second, huge_page_size);
     }
     _pages.clear();
     return 0;
@@ -1764,8 +1764,13 @@ std::string procfs_maps()
             char write   = vma.perm() & perm_write ? 'w' : '-';
             char execute = vma.perm() & perm_exec  ? 'x' : '-';
             char priv    = 'p';
-            osv::fprintf(os, "%x-%x %c%c%c%c 00000000 00:00 0\n",
-                vma.start(), vma.end(), read, write, execute, priv);
+            osv::fprintf(os, "%x-%x %c%c%c%c ", vma.start(), vma.end(), read, write, execute, priv);
+            if (vma.flags() & mmap_file) {
+                const file_vma &f_vma = static_cast<file_vma&>(vma);
+                osv::fprintf(os, "%08x 00:00 0 %s\n", f_vma.offset(), f_vma.file()->f_dentry->d_path);
+            } else {
+                osv::fprintf(os, "00000000 00:00 0\n");
+            }
         }
     }
     return os.str();

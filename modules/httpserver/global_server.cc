@@ -15,8 +15,11 @@
 #include "api/env.hh"
 #include "api/hardware.hh"
 #include "path_holder.hh"
-
+#include "api/network.hh"
 #include <iostream>
+#include <osv/app.hh>
+#include <fstream>
+#include "yaml-cpp/yaml.h"
 
 namespace httpserver {
 
@@ -30,15 +33,34 @@ global_server& global_server::get()
     return *instance;
 }
 
-bool global_server::run()
+bool global_server::run(po::variables_map& _config)
 {
     if (get().s != nullptr) {
         return false;
     }
+    std::ifstream f("/tmp/httpserver.conf");
+    if (f.is_open()) {
+        try {
+            YAML::Node doc = YAML::Load(f);
+            for (auto node : doc) {
+                get().set(node.first.as<std::string>(), node.second.as<std::string>());
+            }
+        } catch (const std::exception& e) {
+            std::cout << "httpserver Failed reading the configuration file " << e.what() <<  std::endl;
+            throw e;
+        }
+    }
+
+    set(_config);
     get().set("ipaddress", "0.0.0.0");
     get().set("port", "8000");
     get().s = new http::server::server(&get().config, &get()._routes);
-    get().s->run(); // never returns from here
+
+    osv::this_application::on_termination_request([&] {
+        get().s->close();
+    });
+
+    get().s->run();
     return true;
 }
 
@@ -71,6 +93,7 @@ global_server& global_server::set(const std::string& key,
 void global_server::set_routes()
 {
     path_holder::set_routes(&_routes);
+    api::network::init(_routes);
     api::os::init(_routes);
     api::fs::init(_routes);
     api::file::init(_routes);

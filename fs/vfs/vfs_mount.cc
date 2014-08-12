@@ -92,7 +92,7 @@ fs_getfsname(vfsops* ops)
 }
 
 int
-sys_mount(const char *dev, const char *dir, const char *fsname, int flags, void *data)
+sys_mount(const char *dev, const char *dir, const char *fsname, int flags, const void *data)
 {
     const struct vfssw *fs;
     struct mount *mp;
@@ -229,7 +229,7 @@ sys_umount2(const char *path, int flags)
     struct mount *mp;
     int error, pathlen;
 
-    DPRINTF(VFSDB_SYSCALL, ("sys_umount: path=%s\n", path));
+    kprintf("VFS: unmounting %s\n", path);
 
     MOUNT_LOCK();
 

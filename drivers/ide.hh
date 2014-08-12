@@ -22,7 +22,7 @@ public:
     explicit ide_drive(pci::device& dev);
     virtual ~ide_drive();
 
-    virtual const std::string get_name(void) { return _driver_name; }
+    virtual std::string get_name(void) const { return _driver_name; }
 
     virtual void dump_config(void);
 
@@ -36,6 +36,7 @@ public:
     static hw_driver* probe(hw_device* dev);
 private:
     static constexpr int SECTOR_SIZE = 512;
+    static constexpr u8 PRIMARY_MASTER = 0xe0 | (0<<4);
 
     enum ide_register_base {
         PORT0 = 0x1f0,

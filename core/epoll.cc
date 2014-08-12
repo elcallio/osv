@@ -15,27 +15,30 @@
 #include <sys/epoll.h>
 #include <sys/poll.h>
 #include <memory>
+#include <stdio.h>
 #include <errno.h>
 
 
 #include <osv/file.h>
 #include <osv/poll.h>
 #include <fs/fs.hh>
+#include <lockfree/ring.hh>
 
 #include <osv/debug.hh>
 #include <unordered_map>
 #include <boost/range/algorithm/find.hpp>
+#include <algorithm>
 
 #include <osv/trace.hh>
 TRACEPOINT(trace_epoll_create, "returned fd=%d", int);
-TRACEPOINT(trace_epoll_ctl, "epfd=%d, fd=%d, op=%s", int, int, const char*);
+TRACEPOINT(trace_epoll_ctl, "epfd=%d, fd=%d, op=%s event=0x%x", int, int, const char*, int);
 TRACEPOINT(trace_epoll_wait, "epfd=%d, maxevents=%d, timeout=%d", int, int, int);
-TRACEPOINT(trace_epoll_ready, "file=%p, event=0x%x", file*, int);
+TRACEPOINT(trace_epoll_ready, "fd=%d file=%p, event=0x%x", int, file*, int);
 
 // We implement epoll using poll(), and therefore need to convert epoll's
 // event bits to and poll(). These are mostly the same, so the conversion
 // is trivial, but we verify this here with static_asserts. We additionally
-// support the epoll-only EPOLLET, but not EPOLLONESHOT.
+// support the epoll-only EPOLLET and EPOLLONESHOT.
 static_assert(POLLIN == EPOLLIN, "POLLIN!=EPOLLIN");
 static_assert(POLLOUT == EPOLLOUT, "POLLOUT!=EPOLLOUT");
 static_assert(POLLRDHUP == EPOLLRDHUP, "POLLRDHUP!=EPOLLRDHUP");
@@ -44,7 +47,7 @@ static_assert(POLLERR == EPOLLERR, "POLLERR!=EPOLLERR");
 static_assert(POLLHUP == EPOLLHUP, "POLLHUP!=EPOLLHUP");
 constexpr int SUPPORTED_EVENTS =
         EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI | EPOLLERR | EPOLLHUP |
-        EPOLLET;
+        EPOLLET | EPOLLONESHOT;
 inline uint32_t events_epoll_to_poll(uint32_t e)
 {
     assert (!(e & ~SUPPORTED_EVENTS));
@@ -64,8 +67,16 @@ struct registered_epoll : epoll_event {
 
 class epoll_file final : public special_file {
     std::unordered_map<epoll_key, registered_epoll> map;
+    std::unordered_set<epoll_key> _activity;
+    waitqueue _waiters;
+    ring_spsc<epoll_key, 256> _activity_ring;
+    std::atomic<bool> _activity_ring_overflow = { false };
+    sched::thread_handle _activity_ring_owner;
 public:
-    epoll_file() : special_file(0, DTYPE_UNSPEC) {}
+    epoll_file()
+        : special_file(0, DTYPE_UNSPEC)
+    {
+    }
     virtual int close() override {
         for (auto& e : map) {
             remove_me(e.first);
@@ -74,12 +85,12 @@ public:
     }
     int add(epoll_key key, struct epoll_event *event)
     {
-        WITH_LOCK(f_lock) {
-            if (map.count(key)) {
-                return EEXIST;
-            }
-            auto fp = key._file;
-            WITH_LOCK(fp->f_lock) {
+        auto fp = key._file;
+        WITH_LOCK(fp->f_lock) {
+            WITH_LOCK(f_lock) {
+                if (map.count(key)) {
+                    return EEXIST;
+                }
                 // I used poll_wake_count-1, to ensure EPOLLET returns once when
                 // registering an epoll after data is already available.
                 map.emplace(key,
@@ -89,76 +100,154 @@ public:
                 }
                 fp->f_epolls->push_back(epoll_ptr{this, key});
             }
-            return 0;
         }
+        fp->epoll_add();
+        if (fp->poll(events_epoll_to_poll(event->events))) {
+            wake(key);
+        }
+        return 0;
     }
     int mod(epoll_key key, struct epoll_event *event)
     {
-        WITH_LOCK(f_lock) {
-            auto fp = key._file;
-            try {
-                WITH_LOCK(fp->f_lock) {
+        auto fp = key._file;
+        WITH_LOCK(fp->f_lock) {
+            WITH_LOCK(f_lock) {
+                try {
                     map.at(key) = registered_epoll(*event, fp->poll_wake_count - 1);
+                } catch (std::out_of_range &e) {
+                    return ENOENT;
                 }
-                return 0;
-            } catch (std::out_of_range &e) {
-                return ENOENT;
             }
         }
+        fp->epoll_add();
+        if (fp->poll(events_epoll_to_poll(event->events))) {
+            wake(key);
+        }
+        return 0;
     }
     int del(epoll_key key)
     {
-        WITH_LOCK(f_lock) {
-            if (map.erase(key)) {
-                remove_me(key);
-                return 0;
-            } else {
-                return ENOENT;
-            }
+        std::unique_lock<mutex> lock(f_lock);
+        if (map.erase(key)) {
+            lock.unlock();
+            remove_me(key);
+            return 0;
+        } else {
+            return ENOENT;
         }
     }
     int wait(struct epoll_event *events, int maxevents, int timeout_ms)
     {
-        std::vector<poll_file> pollfds;
-        std::vector<epoll_key> keys;
+        auto tmo = parse_poll_timeout(timeout_ms);
+        sched::timer tmr(*sched::thread::current());
+        if (tmo) {
+            tmr.set(*tmo);
+        }
+        int nr = 0;
         WITH_LOCK(f_lock) {
-            pollfds.reserve(map.size());
-            keys.reserve(map.size());
-            for (auto &i : map) {
-                int eevents = i.second.events;
-                auto events = events_epoll_to_poll(eevents);
-                pollfds.emplace_back(i.first._file, events, 0,
-                        i.second.last_poll_wake_count);
-                keys.emplace_back(i.first);
-            }
-            int r;
-            DROP_LOCK(f_lock) {
-                r = do_poll(pollfds, parse_poll_timeout(timeout_ms));
-            }
-            int n = 0;
-            if (r > 0) {
-                r = std::min(r, maxevents);
-                for (size_t i = 0; i < pollfds.size() && n < r;  i++) {
-                    if (pollfds[i].revents) {
-                        try {
-                            assert(pollfds[i].fp);
-                            events[n].data = map.at(keys[i]).data;
-                            events[n].events =
-                                    events_poll_to_epoll(pollfds[i].revents);
-                            trace_epoll_ready(pollfds[i].fp.get(), pollfds[i].revents);
-                            if (pollfds[i].events & EPOLLET) {
-                                map.at(keys[i]).last_poll_wake_count =
-                                        pollfds[i].last_poll_wake_count;
-                            }
-                            ++n;
-                        } catch (std::out_of_range& e) {
-                            // raced with epoll_ctl(EPOLL_DEL); ignore
+            while (!tmr.expired() && nr == 0) {
+                if (tmo) {
+                    _activity_ring_owner.reset(*sched::thread::current());
+                    sched::thread::wait_for(f_lock,
+                            _waiters,
+                            tmr,
+                            [&] { return !_activity.empty(); },
+                            [&] { return !_activity_ring.empty(); },
+                            [&] { return _activity_ring_overflow.load(std::memory_order_relaxed); }
+                    );
+                    _activity_ring_owner.clear();
+                }
+
+                flush_activity_ring();
+                // We need to drop f_lock file calling file::poll(), so move _activity to
+                // local storage for processing
+                auto activity = std::move(_activity);
+                assert(_activity.empty());
+                auto i = activity.begin();
+                while (i != activity.end() && nr < maxevents) {
+                    epoll_key key = *i;
+                    auto found = map.find(key);
+                    auto cur = i++;
+                    if (found == map.end()) {
+                        activity.erase(cur);
+                        continue; // raced
+                    }
+                    registered_epoll r_e = found->second;
+                    int active = 0;
+                    if (r_e.events) {
+                        DROP_LOCK(f_lock) {
+                            active = key._file->poll(events_epoll_to_poll(r_e.events));
                         }
                     }
+                    active = events_poll_to_epoll(active);
+                    if (!active || (r_e.events & EPOLLET)) {
+                        activity.erase(cur);
+                    } else {
+                        DROP_LOCK(f_lock) {
+                            key._file->epoll_add();
+                        }
+                    }
+                    if (!active) {
+                        continue;
+                    }
+                    if (r_e.events & EPOLLONESHOT) {
+                        // since we dropped the lock, the key may not be there anymore
+                        auto i = map.find(key);
+                        if (i != map.end()) {
+                            i->second.events = 0;
+                            DROP_LOCK(f_lock) {
+                                key._file->epoll_del();
+                            }
+                        }
+                    }
+                    trace_epoll_ready(key._fd, key._file, active);
+                    events[nr].data = r_e.data;
+                    events[nr].events = active;
+                    ++nr;
                 }
+                // move back !EPOLLET back to main storage
+                if (_activity.empty()) {
+                    // nothing happened, move entire set back in
+                    _activity = std::move(activity);
+                } else {
+                    // move item by item (realistically a copy)
+                    std::move(activity.begin(), activity.end(),
+                            std::inserter(_activity, _activity.begin()));
+                }
+                return nr;
             }
-            return n;
         }
+        return nr;
+    }
+    void flush_activity_ring() {
+        epoll_key ep;
+        while (_activity_ring.pop(ep)) {
+            _activity.insert(ep);
+        }
+        if (_activity_ring_overflow.load(std::memory_order_relaxed)) {
+            _activity_ring_overflow.store(false, std::memory_order_relaxed);
+            for (auto&& x : map) {
+                _activity.insert(x.first);
+            }
+        }
+        // events on _activity_ring only wake up one waiter, so wake up all the rest  now.
+        // we need to do this even if no events were received, since if we exit, then
+        // _activity_ring_owner will remain unset.
+        _waiters.wake_all(f_lock);
+    }
+    void wake(epoll_key key) {
+        WITH_LOCK(f_lock) {
+            auto ins = _activity.insert(key);
+            if (ins.second) {
+                _waiters.wake_all(f_lock);
+            }
+        }
+    }
+    void wake_in_rcu(epoll_key key) {
+        if (!_activity_ring.push(key)) {
+            _activity_ring_overflow.store(true, std::memory_order_relaxed);
+        }
+        _activity_ring_owner.wake();
     }
 private:
     void remove_me(epoll_key key) {
@@ -166,8 +255,10 @@ private:
         WITH_LOCK(fp->f_lock) {
             epoll_ptr ptr{this, key};
             auto i = boost::range::find(*fp->f_epolls, ptr);
-            assert(i != fp->f_epolls->end());
-            fp->f_epolls->erase(i);
+            // may race with a concurrent remove_me(), since we're not holding f_lock:
+            if (i != fp->f_epolls->end()) {
+                fp->f_epolls->erase(i);
+            }
         }
     }
 };
@@ -201,7 +292,8 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     trace_epoll_ctl(epfd, fd,
             op==EPOLL_CTL_ADD ? "EPOLL_CTL_ADD" :
             op==EPOLL_CTL_MOD ? "EPOLL_CTL_MOD" :
-            op==EPOLL_CTL_DEL ? "EPOLL_CTL_DEL" : "?");
+            op==EPOLL_CTL_DEL ? "EPOLL_CTL_DEL" : "?",
+                    event->events);
     fileref epfr(fileref_from_fd(epfd));
     if (!epfr) {
         errno = EBADF;
@@ -261,4 +353,14 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout_
 void epoll_file_closed(epoll_ptr ptr)
 {
     ptr.epoll->del(ptr.key);
+}
+
+void epoll_wake(const epoll_ptr& ep)
+{
+    ep.epoll->wake(ep.key);
+}
+
+void epoll_wake_in_rcu(const epoll_ptr& ep)
+{
+    ep.epoll->wake_in_rcu(ep.key);
 }

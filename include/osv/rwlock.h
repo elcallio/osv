@@ -26,7 +26,7 @@ class rwlock;
 // example: WITH_LOCK(my_rwlock.for_read()) { ... }
 class rwlock_for_read {
 private:
-    rwlock_for_read() = default;
+    rwlock_for_read() {}
 public:
     void lock();
     void unlock();
@@ -40,7 +40,7 @@ public:
 // example: WITH_LOCK(my_rwlock.for_write()) { ... }
 class rwlock_for_write {
 private:
-    rwlock_for_write() = default;
+    rwlock_for_write() {}
 public:
     void lock();
     void unlock();
@@ -75,6 +75,11 @@ public:
     void downgrade();
     bool wowned();
     rwlock_for_write& for_write() { return *this; }
+
+    // has_readers() does not check whether this thread holds the read lock,
+    // but rather whether any thread holds it. Therefore, this function is
+    // inherently prone to races, and should be avoided.
+    bool has_readers();
 
 private:
 
@@ -136,6 +141,8 @@ void rw_runlock(rwlock_t* rw);
 void rw_wunlock(rwlock_t* rw);
 int rw_try_upgrade(rwlock_t* rw);
 void rw_downgrade(rwlock_t* rw);
+int rw_wowned(rwlock_t* rw);
+int rw_has_readers(rwlock_t* rw);
 __END_DECLS
 
 #endif // !__RWLOCK_H__

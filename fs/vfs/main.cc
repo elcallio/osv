@@ -37,6 +37,7 @@
 #include <sys/param.h>
 #include <sys/statvfs.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <limits.h>
 #include <unistd.h>
@@ -57,6 +58,7 @@
 #include <osv/stubbing.hh>
 #include <osv/ioctl.h>
 #include <osv/trace.hh>
+#include <osv/run.hh>
 #include <drivers/console.hh>
 
 #include "vfs.h"
@@ -73,6 +75,11 @@
 #include "libc/libc.hh"
 
 #include <mntent.h>
+#include <sys/mman.h>
+
+#include <osv/clock.hh>
+#include <api/utime.h>
+#include <chrono>
 
 using namespace std;
 
@@ -145,6 +152,47 @@ int open(const char *pathname, int flags, ...)
 }
 
 LFS64(open);
+
+int openat(int dirfd, const char *pathname, int flags, ...)
+{
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    if (pathname[0] == '/' || dirfd == AT_FDCWD) {
+        return open(pathname, flags, mode);
+    }
+
+    struct file *fp;
+    int error = fget(dirfd, &fp);
+    if (error) {
+        errno = error;
+        return -1;
+    }
+
+    struct vnode *vp = fp->f_dentry->d_vnode;
+    vn_lock(vp);
+
+    std::unique_ptr<char []> up (new char[PATH_MAX]);
+    char *p = up.get();
+
+    /* build absolute path */
+    strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
+    strlcat(p, fp->f_dentry->d_path, PATH_MAX);
+    strlcat(p, "/", PATH_MAX);
+    strlcat(p, pathname, PATH_MAX);
+
+    error = open(p, flags, mode);
+
+    vn_unlock(vp);
+    fdrop(fp);
+
+    return error;
+}
 
 int creat(const char *pathname, mode_t mode)
 {
@@ -545,6 +593,15 @@ DIR *opendir(const char *path)
         return NULL;
     }
     return dir;
+}
+
+int dirfd(DIR *dirp)
+{
+    if (!dirp) {
+        return libc_error(EINVAL);
+    }
+
+    return dirp->fd;
 }
 
 int closedir(DIR *dir)
@@ -1582,41 +1639,50 @@ TRACEPOINT(trace_vfs_utimes, "\"%s\"", const char*);
 TRACEPOINT(trace_vfs_utimes_ret, "");
 TRACEPOINT(trace_vfs_utimes_err, "%d", int);
 
-extern "C"
+int futimes(int fd, const struct timeval times[2])
+{
+    return futimesat(fd, nullptr, times);
+}
+
 int futimesat(int dirfd, const char *pathname, const struct timeval times[2])
 {
     struct stat st;
     struct file *fp;
-    char *absolute_path;
-    int length;
     int error;
 
     if ((pathname && pathname[0] == '/') || dirfd == AT_FDCWD)
         return utimes(pathname, times);
 
-    error = fstat(dirfd, &st);
-    if (error) {
-        error = errno;
-        goto out_errno;
-    }
+    // Note: if pathname == NULL, futimesat operates on dirfd itself, and in
+    // that case it doesn't have to be a directory.
+    if (pathname) {
+        error = fstat(dirfd, &st);
+        if (error) {
+            error = errno;
+            goto out_errno;
+        }
 
-    if (!S_ISDIR(st.st_mode)){
-        error = ENOTDIR;
-        goto out_errno;
+        if (!S_ISDIR(st.st_mode)){
+            error = ENOTDIR;
+            goto out_errno;
+        }
     }
 
     error = fget(dirfd, &fp);
     if (error)
         goto out_errno;
 
-    length = strlen(fp->f_dentry->d_path) + strlen(pathname) + 2;
-    absolute_path = (char*)malloc(length);
-    if (pathname)
+    if (pathname) {
+        auto length = strlen(fp->f_dentry->d_path) + strlen(pathname) + 2;
+        auto absolute_path = (char*)malloc(length);
         snprintf(absolute_path, length, "%s/%s", fp->f_dentry->d_path, pathname);
-    else
-        strcpy(absolute_path, fp->f_dentry->d_path);
-    error = utimes(absolute_path, times);
-    free(absolute_path);
+        error = utimes(absolute_path, times);
+        free(absolute_path);
+    } else {
+        // TODO: it's really ugly how we convert the fd to path, and utimes
+        // will need to look up this path again.
+        error = utimes(fp->f_dentry->d_path, times);
+    }
     fdrop(fp);
 
     if (error)
@@ -1668,8 +1734,7 @@ int futimens(int fd, const struct timespec times[2])
     return 0;
 }
 
-extern "C"
-int utimes(const char *pathname, const struct timeval times[2])
+static int do_utimes(const char *pathname, const struct timeval times[2], int flags)
 {
     struct task *t = main_task;
     char path[PATH_MAX];
@@ -1678,19 +1743,51 @@ int utimes(const char *pathname, const struct timeval times[2])
     trace_vfs_utimes(pathname);
 
     error = task_conv(t, pathname, 0, path);
-    if (error)
-        goto out_errno;
+    if (error) {
+        trace_vfs_utimes_err(error);
+        return libc_error(error);
+    }
 
-    error = sys_utimes(path, times);
-    if (error)
-        goto out_errno;
+    error = sys_utimes(path, times, flags);
+    if (error) {
+        trace_vfs_utimes_err(error);
+        return libc_error(error);
+    }
 
     trace_vfs_utimes_ret();
     return 0;
-    out_errno:
-    trace_vfs_utimes_err(error);
-    errno = error;
-    return -1;
+}
+
+extern "C"
+int utimes(const char *pathname, const struct timeval times[2])
+{
+    return do_utimes(pathname, times, 0);
+}
+
+extern "C"
+int lutimes(const char *pathname, const struct timeval times[2])
+{
+    return do_utimes(pathname, times, AT_SYMLINK_NOFOLLOW);
+}
+
+extern "C"
+int utime(const char *pathname, const struct utimbuf *t)
+{
+    using namespace std::chrono;
+
+    struct timeval times[2];
+    times[0].tv_usec = 0;
+    times[1].tv_usec = 0;
+    if (!t) {
+        long int tsec = duration_cast<seconds>(osv::clock::wall::now().time_since_epoch()).count();
+        times[0].tv_sec = tsec;
+        times[1].tv_sec = tsec;
+    } else {
+        times[0].tv_sec = t->actime;
+        times[1].tv_sec = t->modtime;
+    }
+
+    return utimes(pathname, times);
 }
 
 TRACEPOINT(trace_vfs_chmod, "\"%s\" 0%0o", const char*, mode_t);
@@ -1731,6 +1828,79 @@ int chown(const char *path, uid_t owner, gid_t group)
     WARN_STUBBED();
     return 0;
 }
+
+int lchown(const char *path, uid_t owner, gid_t group)
+{
+    WARN_STUBBED();
+    return 0;
+}
+
+
+extern "C"
+int sendfile(int out_fd, int in_fd, off_t *_offset, size_t count)
+{
+    struct file *in_fp;
+    struct file *out_fp;
+    fileref in_f{fileref_from_fd(in_fd)};
+    fileref out_f{fileref_from_fd(out_fd)};
+
+    if (!in_f || !out_f) {
+        return libc_error(EBADF);
+    }
+
+    in_fp = in_f.get();
+    out_fp = out_f.get();
+
+    if (!in_fp->f_dentry) {
+        return libc_error(EBADF);
+    }
+
+    if (!(in_fp->f_flags & FREAD)) {
+        return libc_error(EBADF);
+    }
+
+    if (out_fp->f_type & DTYPE_VNODE) {
+        if (!out_fp->f_dentry) {
+            return libc_error(EBADF);
+	} else if (!(out_fp->f_flags & FWRITE)) {
+            return libc_error(EBADF);
+	}
+    }
+
+    off_t offset ;
+
+    if (_offset != nullptr) {
+        offset = *_offset;
+    } else {
+        /* if _offset is NULL, we need to read from the present position of in_fd */
+        offset = lseek(in_fd, 0, SEEK_CUR);
+    }
+
+    size_t bytes_to_mmap = count + (offset % mmu::page_size);
+    off_t offset_for_mmap =  align_down(offset, (off_t)mmu::page_size);
+
+    char *src = static_cast<char *>(mmap(nullptr, bytes_to_mmap, PROT_READ, MAP_SHARED, in_fd, offset_for_mmap));
+
+    if (src == MAP_FAILED) {
+        return -1;
+    }
+
+    auto ret = write(out_fd, src + (offset % PAGESIZE), count);
+
+    if (ret < 0) {
+        return libc_error(errno);
+    } else if(_offset == NULL) {
+        lseek(in_fd, ret, SEEK_CUR);
+    } else {
+        *_offset += ret;
+    }
+
+    assert(munmap(src, count) == 0);
+
+    return ret;
+}
+
+LFS64(sendfile);
 
 NO_SYS(int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags));
 
@@ -1853,6 +2023,29 @@ int nmount(struct iovec *iov, unsigned niov, int flags)
     return sys_mount(a.from, a.fspath, a.fstype, flags, nullptr);
 }
 
+static void import_extra_zfs_pools(void)
+{
+    struct stat st;
+    int ret;
+
+    // The file '/etc/mnttab' is a LibZFS requirement and will not
+    // exist during cpiod phase. The functionality provided by this
+    // function isn't needed during that phase, so let's skip it.
+    if (stat("/etc/mnttab" , &st) != 0) {
+        return;
+    }
+
+    // Import extra pools mounting datasets there contained.
+    // Datasets from osv pool will not be mounted here.
+    vector<string> zpool_args = {"zpool", "import", "-f", "-a" };
+    auto ok = osv::run("zpool.so", zpool_args, &ret);
+    assert(ok);
+
+    if (!ret) {
+        debug("zfs: extra ZFS pool(s) found.\n");
+    }
+}
+
 extern "C" void mount_zfs_rootfs(void)
 {
     int ret;
@@ -1892,8 +2085,10 @@ extern "C" void mount_zfs_rootfs(void)
         if (ret) {
             printf("failed to mount %s, error = %s\n", m->mnt_type, strerror(ret));
         }
-    } while (m != nullptr);
+    }
     endmntent(ent);
+
+    import_extra_zfs_pools();
 }
 
 extern "C" void unmount_rootfs(void)

@@ -154,6 +154,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m,
 	struct pf_mtag *t;
 	int loop_copy = 1;
 	int hlen;	/* link layer header length */
+	bool is_ifaddr = false;
 
 	if (ro != NULL) {
 		if (!(m->m_hdr.mh_flags & (M_BCAST | M_MCAST)))
@@ -168,6 +169,10 @@ ether_output(struct ifnet *ifp, struct mbuf *m,
 	    (ifp->if_drv_flags & IFF_DRV_RUNNING)))
 		senderr(ENETDOWN);
 
+	if (lle != NULL && (lle->la_flags & LLE_IFADDR)) {
+		is_ifaddr = true;
+	}
+
 	hlen = ETHER_HDR_LEN;
 	switch (dst->sa_family) {
 #ifdef INET
@@ -175,7 +180,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m,
 		if (lle != NULL && (lle->la_flags & LLE_VALID))
 			memcpy(edst, &lle->ll_addr.mac16, sizeof(edst));
 		else
-			error = arpresolve(ifp, rt0, m, dst, edst, &lle);
+			error = arpresolve(ifp, rt0, m, dst, edst, is_ifaddr);
 		if (error)
 			return (error == EWOULDBLOCK ? 0 : error);
 		type = htons(ETHERTYPE_IP);
@@ -238,7 +243,7 @@ ether_output(struct ifnet *ifp, struct mbuf *m,
 		senderr(EAFNOSUPPORT);
 	}
 
-	if (lle != NULL && (lle->la_flags & LLE_IFADDR)) {
+	if (is_ifaddr) {
 		int csum_flags = 0;
 		if (m->M_dat.MH.MH_pkthdr.csum_flags & CSUM_IP)
 			csum_flags |= (CSUM_IP_CHECKED|CSUM_IP_VALID);
@@ -921,7 +926,7 @@ ether_ifattach(struct ifnet *ifp, const u_int8_t *lla)
 		if (lla[i] != 0)
 			break; 
 	if (i != ifp->if_addrlen)
-		debugf("%s: ethernet address: %x:%x:%x:%x:%x:%x\n",
+		debugf("%s: ethernet address: %02x:%02x:%02x:%02x:%02x:%02x\n",
 		    ifp->if_xname, lla[0], lla[1], lla[2], lla[3], lla[4], lla[5]);
 }
 

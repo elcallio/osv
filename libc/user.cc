@@ -208,6 +208,14 @@ getgrgid_r (gid_t gid, struct group *grp, char *buffer, size_t buflen,
     return 0;
 }
 
+struct group *getgrgid(gid_t gid)
+{
+    if (gid != getgid()) {
+        return NULL;
+    }
+    return &single_group;
+}
+
 int getgroups(int size, gid_t list[])
 {
     return 0;
@@ -216,4 +224,60 @@ int getgroups(int size, gid_t list[])
 int setgroups(size_t size, const gid_t *list)
 {
     return 0;
+}
+
+static int retpstatic = 1;
+static int retgstatic = 1;
+
+struct passwd *getpwent(void)
+{
+    if (retpstatic) {
+        retpstatic = 0;
+        return &single_user;
+    }
+    return nullptr;
+}
+
+void setpwent(void)
+{
+    retpstatic = 1;
+}
+weak_alias(setpwent, endpwent);
+
+struct group *getgrent(void)
+{
+    if (retgstatic) {
+        retgstatic = 0;
+        return &single_group;
+    }
+    return nullptr;
+}
+
+void setgrent(void)
+{
+    retgstatic = 1;
+}
+weak_alias(setgrent, endgrent);
+
+char *getlogin(void)
+{
+    return username;
+}
+
+int getlogin_r(char *buf, size_t bufsize)
+{
+    if (bufsize <= strlen(username)) {
+        return ERANGE;
+    }
+    snprintf(buf, bufsize, "%s", username);
+    return 0;
+}
+
+char *cuserid(char *string)
+{
+    if (string) {
+        snprintf(string, L_cuserid, "%s", username);
+        return string;
+    }
+    return username;
 }

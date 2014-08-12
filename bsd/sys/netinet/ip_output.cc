@@ -58,6 +58,8 @@
 #include <bsd/sys/netinet/ip_var.h>
 #include <bsd/sys/netinet/ip_options.h>
 
+#include <bsd/sys/net/routecache.hh>
+
 #ifdef IPSEC
 #include <netinet/ip_ipsec.h>
 #include <netipsec/ipsec.h>
@@ -111,6 +113,8 @@ ip_output(struct mbuf *m, struct mbuf *opt, struct route *ro, int flags,
 	struct rtentry *rte;	/* cache for ro->ro_rt */
 	struct in_addr odst;
 	struct m_tag *fwd_tag = NULL;
+	struct rtentry rte_one;
+	int have_ia_ref;
 #ifdef IPSEC
 	int no_route_but_check_spd = 0;
 #endif
@@ -125,10 +129,8 @@ ip_output(struct mbuf *m, struct mbuf *opt, struct route *ro, int flags,
 		}
 	}
 
-	if (ro == NULL) {
 		ro = &iproute;
 		bzero(ro, sizeof (*ro));
-	}
 
 #ifdef FLOWTABLE
 	if (ro->ro_rt == NULL) {
@@ -178,6 +180,7 @@ ip_output(struct mbuf *m, struct mbuf *opt, struct route *ro, int flags,
 	dst = (struct bsd_sockaddr_in *)&ro->ro_dst;
 again:
 	ia = NULL;
+	have_ia_ref = 0;
 	/*
 	 * If there is a cached route,
 	 * check that it is to the same destination
@@ -214,6 +217,7 @@ again:
 			error = ENETUNREACH;
 			goto bad;
 		}
+		have_ia_ref = 1;
 		ip->ip_dst.s_addr = INADDR_BROADCAST;
 		dst->sin_addr = ip->ip_dst;
 		ifp = ia->ia_ifp;
@@ -226,6 +230,7 @@ again:
 			error = ENETUNREACH;
 			goto bad;
 		}
+		have_ia_ref = 1;
 		ifp = ia->ia_ifp;
 		ip->ip_ttl = 1;
 		isbroadcast = in_broadcast(dst->sin_addr, ifp);
@@ -237,6 +242,8 @@ again:
 		 */
 		ifp = imo->imo_multicast_ifp;
 		IFP_TO_IA(ifp, ia);
+		if (ia)
+			have_ia_ref = 1;
 		isbroadcast = 0;	/* fool gcc */
 	} else {
 		/*
@@ -250,8 +257,8 @@ again:
 			    ntohl(ip->ip_src.s_addr ^ ip->ip_dst.s_addr),
 			    inp ? inp->inp_inc.inc_fibnum : M_GETFIB(m));
 #else
-			in_rtalloc_ign(ro, 0,
-			    inp ? inp->inp_inc.inc_fibnum : M_GETFIB(m));
+			route_cache::lookup(dst, inp ? inp->inp_inc.inc_fibnum : M_GETFIB(m), &rte_one);
+			ro->ro_rt = &rte_one;
 #endif
 			rte = ro->ro_rt;
 		}
@@ -272,7 +279,6 @@ again:
 			goto bad;
 		}
 		ia = ifatoia(rte->rt_ifa);
-		ifa_ref(&ia->ia_ifa);
 		ifp = rte->rt_ifp;
 		rte->rt_rmx.rmx_pksent++;
 		if (rte->rt_flags & RTF_GATEWAY)
@@ -510,7 +516,7 @@ sendit:
 			error = netisr_queue(NETISR_IP, m);
 			goto done;
 		} else {
-			if (ia != NULL)
+			if (have_ia_ref)
 				ifa_free(&ia->ia_ifa);
 			goto again;	/* Redo the routing table lookup. */
 		}
@@ -543,7 +549,7 @@ sendit:
 		m->m_hdr.mh_flags |= M_SKIP_FIREWALL;
 		m->m_hdr.mh_flags &= ~M_IP_NEXTHOP;
 		m_tag_delete(m, fwd_tag);
-		if (ia != NULL)
+		if (have_ia_ref)
 			ifa_free(&ia->ia_ifa);
 		goto again;
 	}
@@ -653,9 +659,7 @@ passout:
 		IPSTAT_INC(ips_fragmented);
 
 done:
-	if (ro == &iproute)
-		RO_RTFREE(ro);
-	if (ia != NULL)
+	if (have_ia_ref)
 		ifa_free(&ia->ia_ifa);
 	return (error);
 bad:

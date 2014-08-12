@@ -87,10 +87,17 @@ def format_args(args):
 def get_command_line(basic_apps):
     return '&'.join((format_args(app.get_launcher_args()) for app in basic_apps))
 
-def make_modules(modules):
+def make_cmd(cmdline, jobserver):
+    ret = 'make ' + cmdline
+    if jobserver is not None:
+        ret += ' -j --jobserver-fds=' + jobserver
+    return ret
+
+def make_modules(modules, args):
     for module in modules:
         if os.path.exists(os.path.join(module.local_path, 'Makefile')):
-            if subprocess.call(["make module"], shell=True, cwd=module.local_path):
+            if subprocess.call(make_cmd('module', jobserver = args.jobserver_fds),
+                               shell=True, cwd=module.local_path):
                 raise Exception('make failed for ' + module.name)
 
 def flatten_list(elememnts):
@@ -127,6 +134,10 @@ def generate_cmdline(apps):
             print("No apps selected")
 
 def build(args):
+    add_default = True
+    if args.image_config[0] == "!":
+        add_default = False
+        args.image_config = args.image_config[1:]
     image_config_file = os.path.join(image_configs_dir, args.image_config + '.py')
     if os.path.exists(image_config_file):
         print("Using image config: %s" % image_config_file)
@@ -147,7 +158,7 @@ def build(args):
                 disabled_modules.add(module[1:])
         module_names = []
         config = resolve.read_config()
-        if "default" in config:
+        if add_default and "default" in config:
             module_names +=  config["default"]
         module_names += args.image_config.split(",")
         for missing in list(disabled_modules - set(module_names)):
@@ -173,7 +184,7 @@ def build(args):
     for module in modules:
         print("  " + module.name)
 
-    make_modules(modules)
+    make_modules(modules, args)
 
     apps_to_run = get_basic_apps(run_list)
     generate_manifests(modules, apps_to_run)
@@ -188,14 +199,20 @@ def clean(args):
         if os.path.exists(os.path.join(local_path, 'Makefile')):
             if not args.quiet:
                 print('Cleaning ' + local_path + ' ...')
-            if subprocess.call(["make -q clean"], shell=True, cwd=local_path, stderr=subprocess.PIPE, **extra_args) != 2:
-                if subprocess.call(["make clean"], shell=True, cwd=local_path, **extra_args):
+            if subprocess.call(make_cmd('-q clean', jobserver = args.jobserver_fds),
+                               shell=True, cwd=local_path, stderr=subprocess.PIPE, **extra_args) != 2:
+                if subprocess.call(make_cmd('clean', jobserver = args.jobserver_fds),
+                                   shell=True, cwd=local_path, **extra_args):
                     raise Exception('\'make clean\' failed in ' + local_path)
 
 if __name__ == "__main__":
     image_configs_dir = resolve.get_images_dir()
 
     parser = argparse.ArgumentParser(prog='module.py')
+    parser.add_argument('--jobserver-fds', action = 'store', default = None,
+                        help = 'make -j support')
+    parser.add_argument('-j', action = 'store_true', default = None,
+                        help = 'make -j support')
     subparsers = parser.add_subparsers(help="Command")
 
     build_cmd = subparsers.add_parser("build", help="Build modules")
@@ -208,4 +225,6 @@ if __name__ == "__main__":
     clean_cmd.set_defaults(func=clean)
 
     args = parser.parse_args()
+    if 'j' not in args:
+        args.jobserver_fds = None
     args.func(args)

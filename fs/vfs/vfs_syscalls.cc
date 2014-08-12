@@ -324,41 +324,25 @@ sys_lseek(struct file *fp, off_t off, int type, off_t *origin)
 	}
 
 	vp = fp->f_dentry->d_vnode;
+	int error = EINVAL;
 	vn_lock(vp);
 	switch (type) {
-	case SEEK_SET:
-		if (off < 0)
-			off = 0;
-		break;
 	case SEEK_CUR:
-		if (fp->f_offset + off > vp->v_size)
-			off = vp->v_size;
-		else if (fp->f_offset + off < 0)
-			off = 0;
-		else
-			off = fp->f_offset + off;
+		off = fp->f_offset + off;
 		break;
 	case SEEK_END:
-		if (off > 0)
-			off = vp->v_size;
-		else if (vp->v_size + off < 0)
-			off = 0;
-		else
-			off = vp->v_size + off;
+		off = vp->v_size + off;
 		break;
-	default:
-		vn_unlock(vp);
-		return EINVAL;
 	}
-	/* Request to check the file offset */
-	if (VOP_SEEK(vp, fp, fp->f_offset, off) != 0) {
-		vn_unlock(vp);
-		return EINVAL;
+	if (off >= 0) {
+		error = VOP_SEEK(vp, fp, fp->f_offset, off);
+		if (!error) {
+			*origin      = off;
+			fp->f_offset = off;
+		}
 	}
-	*origin = off;
-	fp->f_offset = off;
 	vn_unlock(vp);
-	return 0;
+	return error;
 }
 
 int
@@ -1252,7 +1236,7 @@ static void convert_timeval(struct timespec &to, const struct timeval *from)
 }
 
 int
-sys_utimes(char *path, const struct timeval times[2])
+sys_utimes(char *path, const struct timeval times[2], int flags)
 {
     int error;
     struct dentry *dp;
@@ -1267,9 +1251,25 @@ sys_utimes(char *path, const struct timeval times[2])
     convert_timeval(timespec_times[0], times ? times + 0 : nullptr);
     convert_timeval(timespec_times[1], times ? times + 1 : nullptr);
 
-    error = namei(path, &dp);
-    if (error)
-        return error;
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        struct dentry *ddp;
+        error = lookup(path, &ddp, nullptr);
+        if (error) {
+            return error;
+        }
+
+        error = namei_last_nofollow(path, ddp, &dp);
+        if (ddp != NULL) {
+            drele(ddp);
+        }
+        if (error) {
+            return error;
+        }
+    } else {
+        error = namei(path, &dp);
+        if (error)
+            return error;
+    }
 
     if (dp->d_mount->m_flags & MNT_RDONLY) {
         error = EROFS;

@@ -23,6 +23,8 @@
 #include <osv/sched.hh>
 #include <osv/trace.hh>
 #include <osv/version.hh>
+#include <osv/stubbing.hh>
+#include <sys/utsname.h>
 
 #include "arch.hh"
 
@@ -293,14 +295,14 @@ void file::load_segment(const Elf64_Phdr& phdr)
     if (phdr.p_flags & PF_R)
         perm |= mmu::perm_read;
 
-    auto mlock_flag = mlocked() ? mmu::mmap_populate : 0;
-    mmu::map_file(_base + vstart, filesz, mmu::mmap_fixed | mlock_flag, perm,
-                  _f, align_down(phdr.p_offset, mmu::page_size));
+    auto flag = mmu::mmap_fixed | (mlocked() ? mmu::mmap_populate : 0);
+    mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size));
     if (phdr.p_filesz != phdr.p_memsz) {
         assert(perm & mmu::perm_write);
         memset(_base + vstart + filesz_unaligned, 0, filesz - filesz_unaligned);
-        mmu::map_anon(_base + vstart + filesz, memsz - filesz,
-                      mmu::mmap_fixed | mlock_flag, perm);
+        if (memsz != filesz) {
+            mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm);
+        }
     }
 }
 
@@ -462,6 +464,9 @@ bool object::dynamic_exists(unsigned tag)
 
 Elf64_Dyn* object::_dynamic_tag(unsigned tag)
 {
+    if (!_dynamic_table) {
+        return nullptr;
+    }
     for (auto p = _dynamic_table; p->d_tag != DT_NULL; ++p) {
         if (p->d_tag == tag) {
             return p;
@@ -1111,7 +1116,7 @@ symbol_module program::lookup(const char* name)
 {
     trace_elf_lookup(name);
     symbol_module ret(nullptr,nullptr);
-    elf::get_program()->with_modules([&](const elf::program::modules_list &ml)
+    with_modules([&](const elf::program::modules_list &ml)
     {
         for (auto module : ml.objects) {
             if (auto sym = module->lookup_symbol(name)) {
@@ -1139,7 +1144,7 @@ dladdr_info program::lookup_addr(const void* addr)
 {
     trace_elf_lookup_addr(addr);
     dladdr_info ret;
-    elf::get_program()->with_modules([&](const elf::program::modules_list &ml)
+    with_modules([&](const elf::program::modules_list &ml)
     {
         for (auto module : ml.objects) {
             ret = module->lookup_addr(addr);
@@ -1372,5 +1377,52 @@ void* __tls_get_addr(module_and_offset* mao)
     abort();
 #endif /* AARCH64_PORT_STUB */
 
-    return s_program->tls_addr(mao->module) + mao->offset;
+    return get_program()->tls_addr(mao->module) + mao->offset;
+}
+
+
+// We can just call uname, because that will copy the strings to a temporary
+// buffer, that won't be alive after this function return. We could of course
+// have a static area and copy only once. But since our uname implementation
+// also uses a static area for uname, we can just return that.
+extern utsname utsname;
+
+extern "C"
+unsigned long getauxval(unsigned long type)
+{
+    switch (type) {
+    // Implemented, and really 0
+    case AT_EUID:
+    case AT_EGID:
+    case AT_UID:
+        return 0;
+
+    // Implemented, with real value
+    case AT_BASE:
+        return program_base;
+    case AT_PLATFORM:
+        return reinterpret_cast<long>(utsname.machine);
+    case AT_PAGESZ:
+        return sysconf(_SC_PAGESIZE);
+    case AT_CLKTCK:
+        return sysconf(_SC_CLK_TCK);
+
+    // Unimplemented, man page says we should return 0
+    case AT_PHDR:
+    case AT_PHENT:
+    case AT_PHNUM:
+    case AT_DCACHEBSIZE:
+    case AT_ENTRY:
+    case AT_EXECFD:
+    case AT_EXECFN:
+    case AT_HWCAP:
+    case AT_ICACHEBSIZE:
+    case AT_RANDOM:
+    case AT_SECURE:
+    case AT_UCACHEBSIZE:
+        WARN_STUBBED();
+        return 0;
+    default:
+        return 0;
+    }
 }

@@ -13,12 +13,13 @@ standard_ec2_post_install = ['pip install awscli &&'
                              'mkdir /usr/local/ec2 &&'
                              'unzip ec2-api-tools.zip -d /usr/local/ec2 &&'
                              'rm -f ec2-api-tools.zip &&'
-                             'cat /etc/environment | grep -v "^EC2_HOME=" | grep -v "^JAVA_HOME" | cat > /etc/environment_temp &&'
+                             'cat /etc/environment | grep -v "^EC2_HOME=" | grep -v "^JAVA_HOME" | grep -v "PATH=\$EC2_HOME" | cat > /etc/environment_temp &&'
                              'echo "EC2_HOME=`ls -d /usr/local/ec2/ec2-api-tools-*`" >> /etc/environment_temp &&'
                              'echo "JAVA_HOME=`readlink -f /usr/bin/javac | sed \"s:bin/javac::\"`" >> /etc/environment_temp &&'
+                             'echo "PATH=\$EC2_HOME/bin:\$PATH" >> /etc/environment_temp &&'
+                             'cp /etc/environment /etc/environment.bk &&'
                              'mv /etc/environment_temp /etc/environment &&'
                              'echo Done. Re-login to apply environment changes for EC2']
-
 
 class Fedora(object):
     name = 'Fedora'
@@ -47,9 +48,9 @@ class Ubuntu(object):
                 'libmaven-shade-plugin-java', 'python-dpkt', 'tcpdump gdb', 'qemu-system-x86',
                 'gawk'
                 ]
-    ec2_packages = standard_ec2_packages
+    ec2_packages = standard_ec2_packages + ['ec2-api-tools', 'awscli']
     test_packages = ['libssl-dev']
-    ec2_post_install = standard_ec2_post_install
+    ec2_post_install = None
 
     class Ubuntu_14_04(object):
         packages = []
@@ -82,7 +83,7 @@ for distro in distros:
                 if cmdargs.test:
                     pkg += distro.test_packages + dver.test_packages
                 subprocess.check_call(distro.install + ' ' + str.join(' ', pkg), shell = True)
-                if cmdargs.ec2:
+                if cmdargs.ec2 and distro.ec2_post_install:
                     subprocess.check_call(distro.ec2_post_install, shell = True)
                 sys.exit(0)
         print 'Your distribution version is not supported by this script'

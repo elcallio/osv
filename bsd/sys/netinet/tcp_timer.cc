@@ -62,6 +62,10 @@
 #include <bsd/sys/netinet/tcp_debug.h>
 #endif
 
+TRACEPOINT(trace_tcp_timer_tso_flush, "");
+TRACEPOINT(trace_tcp_timer_tso_flush_ret, "");
+TRACEPOINT(trace_tcp_timer_tso_flush_err, "");
+
 int	tcp_keepinit;
 SYSCTL_PROC(_net_inet_tcp, TCPCTL_KEEPINIT, keepinit, CTLTYPE_INT|CTLFLAG_RW,
     &tcp_keepinit, 0, sysctl_msec_to_ticks, "I", "time to establish connection");
@@ -422,6 +426,36 @@ out:
 }
 
 static void
+tcp_timer_tso_flush(serial_timer_task& timer, struct tcpcb *tp)
+{
+	trace_tcp_timer_tso_flush();
+
+	CURVNET_SET(tp->t_vnet);
+	struct inpcb *inp = tp->t_inpcb;
+
+
+	KASSERT(inp != NULL, ("tcp_timer_tso_flush: inp == NULL"));
+	KASSERT(tp->t_flags & TF_TSO, "tcp_timer_tso_flush: TSO disabled");
+	INP_LOCK(inp);
+
+	// Re-check the TF_TSO_PENDING flag under the lock
+	if (!timer.try_fire() || !(tp->t_flags & TF_TSO_PENDING)) {
+		INP_UNLOCK(inp);
+		CURVNET_RESTORE();
+		trace_tcp_timer_tso_flush_err();
+		return;
+	}
+
+	tp->t_flags |= TF_TSO_NOW;
+	(void) tcp_output(tp);
+
+	INP_UNLOCK(inp);
+	CURVNET_RESTORE();
+
+	trace_tcp_timer_tso_flush_ret();
+}
+
+static void
 tcp_timer_rexmt(serial_timer_task& timer, struct tcpcb *tp)
 {
 	CURVNET_SET(tp->t_vnet);
@@ -433,7 +467,7 @@ tcp_timer_rexmt(serial_timer_task& timer, struct tcpcb *tp)
 
 	ostate = tp->get_state();
 #endif
-	INP_INFO_RLOCK(&V_tcbinfo);
+	INP_INFO_WLOCK(&V_tcbinfo);
 
 	inp = tp->t_inpcb;
 
@@ -446,14 +480,14 @@ tcp_timer_rexmt(serial_timer_task& timer, struct tcpcb *tp)
 
 	if (!timer.try_fire()) {
 		INP_UNLOCK(inp);
-		INP_INFO_RUNLOCK(&V_tcbinfo);
+		INP_INFO_WUNLOCK(&V_tcbinfo);
 		CURVNET_RESTORE();
 		return;
 	}
 
 	if ((inp->inp_flags & INP_DROPPED) != 0) {
 		INP_UNLOCK(inp);
-		INP_INFO_RUNLOCK(&V_tcbinfo);
+		INP_INFO_WUNLOCK(&V_tcbinfo);
 		CURVNET_RESTORE();
 		return;
 	}
@@ -467,7 +501,7 @@ tcp_timer_rexmt(serial_timer_task& timer, struct tcpcb *tp)
 		tp->t_rxtshift = TCP_MAXRXTSHIFT;
 		TCPSTAT_INC(tcps_timeoutdrop);
 		in_pcbref(inp);
-		INP_INFO_RUNLOCK(&V_tcbinfo);
+		INP_INFO_WUNLOCK(&V_tcbinfo);
 		INP_UNLOCK(inp);
 		INP_INFO_WLOCK(&V_tcbinfo);
 		INP_LOCK(inp);
@@ -488,7 +522,7 @@ tcp_timer_rexmt(serial_timer_task& timer, struct tcpcb *tp)
 		headlocked = 1;
 		goto out;
 	}
-	INP_INFO_RUNLOCK(&V_tcbinfo);
+	INP_INFO_WUNLOCK(&V_tcbinfo);
 	headlocked = 0;
 	if (tp->t_rxtshift == 1) {
 		/*
@@ -611,6 +645,9 @@ init_timers(struct tcp_timer* timers, struct tcpcb *tp, struct inpcb *inp)
 
 	timers->timers[tcp_timer_type::TT_2MSL] =
 		new serial_timer_task(inp->inp_lock, std::bind(tcp_timer_2msl, _1, tp));
+
+	timers->timers[tcp_timer_type::TT_TSO_FLUSH] =
+		new serial_timer_task(inp->inp_lock, std::bind(tcp_timer_tso_flush, _1, tp));
 }
 
 serial_timer_task&
