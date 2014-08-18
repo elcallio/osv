@@ -241,6 +241,7 @@ boost-tests += tests/tst-timer-set.so
 boost-tests += tests/tst-clock.so
 boost-tests += tests/tst-rcu-hashtable.so
 boost-tests += tests/tst-unordered-ring-mpsc.so
+boost-tests += tests/tst-seek.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -299,6 +300,7 @@ tests += tests/misc-tcp-hash-srv.so
 tests += tests/misc-loadbalance.so
 tests += tests/misc-scheduler.so
 tests += tests/misc-setpriority.so
+tests += tests/misc-timeslice.so
 tests += tests/tst-dns-resolver.so
 tests += tests/tst-fs-link.so
 tests += tests/tst-kill.so
@@ -345,8 +347,8 @@ tests += tests/tst-printf.so
 tests += tests/tst-pthread-affinity.so
 tests += tests/tst-pthread-tsd.so
 tests += tests/tst-thread-local.so
-tests += tests/tst-seek.so
 tests += tests/tst-app.so
+tests += tests/misc-gtod.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -862,6 +864,7 @@ objects += core/sched.o
 objects += core/mmio.o
 objects += core/kprintf.o
 objects += core/trace.o
+objects += core/trace-count.o
 objects += core/callstack.o
 objects += core/poll.o
 objects += core/select.o

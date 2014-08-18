@@ -114,7 +114,7 @@ vn_lookup(struct mount *mp, uint64_t ino)
 			return vp;
 		}
 	}
-	return NULL;		/* not found */
+	return nullptr;		/* not found */
 }
 
 #ifdef DEBUG_VFS
@@ -171,7 +171,7 @@ vget(struct mount *mp, uint64_t ino, struct vnode **vpp)
 	struct vnode *vp;
 	int error;
 
-	*vpp = NULL;
+	*vpp = nullptr;
 
 	DPRINTF(VFSDB_VNODE, ("vget %LLu\n", ino));
 
@@ -184,7 +184,7 @@ vget(struct mount *mp, uint64_t ino, struct vnode **vpp)
 		return 1;
 	}
 
-	if (!(vp = malloc(sizeof(struct vnode)))) {
+	if (!(vp = new vnode)) {
 		VNODE_UNLOCK();
 		return 0;
 	}
@@ -205,8 +205,8 @@ vget(struct mount *mp, uint64_t ino, struct vnode **vpp)
 	if ((error = VFS_VGET(mp, vp)) != 0) {
 		VNODE_UNLOCK();
 		mutex_destroy(&vp->v_lock);
-		free(vp);
-		return NULL;
+		delete vp;
+		return error;
 	}
 	vfs_busy(vp->v_mount);
 	mutex_lock(&vp->v_lock);
@@ -251,7 +251,7 @@ vput(struct vnode *vp)
 	ASSERT(vp->v_nrlocks == 0);
 	mutex_unlock(&vp->v_lock);
 	mutex_destroy(&vp->v_lock);
-	free(vp);
+	delete vp;
 }
 
 /*
@@ -297,7 +297,7 @@ vrele(struct vnode *vp)
 	VOP_INACTIVE(vp);
 	vfs_unbusy(vp->v_mount);
 	mutex_destroy(&vp->v_lock);
-	free(vp);
+	delete vp;
 }
 
 /*

@@ -52,7 +52,7 @@ static mutex_t ramfs_lock = MUTEX_INITIALIZER;
 static uint64_t inode_count = 1; /* inode 0 is reserved to root */
 
 struct ramfs_node *
-ramfs_allocate_node(char *name, int type)
+ramfs_allocate_node(const char *name, int type)
 {
 	struct ramfs_node *np;
 
@@ -448,7 +448,6 @@ ramfs_readdir(struct vnode *vp, struct file *fp, struct dirent *dir)
 	return 0;
 }
 
-extern "C"
 int
 ramfs_init(void)
 {
