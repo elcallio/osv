@@ -7,6 +7,8 @@
 
 #include "formatter.hh"
 #include "json_elements.hh"
+#include <float.h>
+#include <boost/math/special_functions/fpclassify.hpp>
 
 using namespace std;
 
@@ -36,6 +38,17 @@ string formatter::to_json(long n)
     return to_string(n);
 }
 
+string formatter::to_json(float f)
+{
+    int inf;
+    if ((inf = boost::math::isinf(f))) {
+        f = inf * FLT_MAX;
+    } else if (boost::math::isnan(f)) {
+        f = 0;
+    }
+    return to_string(f);
+}
+
 string formatter::to_json(bool b)
 {
     return (b) ? "true" : "false";
@@ -50,7 +63,7 @@ string formatter::to_json(const date_time& d)
     return res + "\"";
 }
 
-string formatter::to_json(const json_base& obj) {
+string formatter::to_json(const jsonable& obj) {
     return obj.to_json();
 }
 

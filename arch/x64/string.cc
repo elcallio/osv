@@ -14,6 +14,8 @@
 #include "memcpy_decode.hh"
 #include <assert.h>
 #include <x86intrin.h>
+#include <osv/initialize.hh>
+#include "sse.hh"
 
 extern "C"
 void *memcpy_base(void *__restrict dest, const void *__restrict src, size_t n);
@@ -135,71 +137,98 @@ static inline void* small_memcpy(void *dest, const void *src, size_t n)
     return small_memcpy_table[n](dest, src);
 }
 
-template <unsigned N>
-struct sse_register_file;
-
-template <>
-struct sse_register_file<0> {
-    void load(const __m128i* p) {}
-    void store(__m128i* p) {}
-};
-
-template <unsigned N>
-struct sse_register_file : sse_register_file<N-1> {
-    __m128i reg;
-    void load(const __m128i* p) {
-        sse_register_file<N-1>::load(p);
-        reg = _mm_loadu_si128(&p[N-1]);
-    }
-    void store(__m128i* p) {
-        sse_register_file<N-1>::store(p);
-        _mm_storeu_si128(&p[N-1], reg);
-    }
-};
-
-template <unsigned N>
-__attribute__((optimize("unroll-loops"), optimize("omit-frame-pointer")))
-void do_sse_memcpy(void* dest, const void* src)
+template <unsigned N, typename loader, typename storer>
+inline
+void do_sse_memcpy_body(void* dest, const void* src)
 {
+    loader load;
+    storer store;
+    sse_register_file<16> sse;
+    for (unsigned i = 0; i < N; ++i) {
+        load(sse, reinterpret_cast<const __m128i*>(src) + i * 16);
+        store(sse, reinterpret_cast<__m128i*>(dest) + i * 16);
+    }
+}
+
+template <unsigned N, typename loader, typename storer>
+inline
+void do_sse_memcpy_tail(void* dest, const void* src)
+{
+    loader load;
+    storer store;
     auto sse_dest = static_cast<__m128i*>(dest);
     auto sse_src = static_cast<const __m128i*>(src);
     sse_register_file<N> regs;
-    regs.load(sse_src);
-    regs.store(sse_dest);
+    load(regs, sse_src);
+    store(regs, sse_dest);
 }
 
-static void (* const sse_memcpy_table[16])(void*, const void*) = {
-    do_sse_memcpy<0>,
-    do_sse_memcpy<1>,
-    do_sse_memcpy<2>,
-    do_sse_memcpy<3>,
-    do_sse_memcpy<4>,
-    do_sse_memcpy<5>,
-    do_sse_memcpy<6>,
-    do_sse_memcpy<7>,
-    do_sse_memcpy<8>,
-    do_sse_memcpy<9>,
-    do_sse_memcpy<10>,
-    do_sse_memcpy<11>,
-    do_sse_memcpy<12>,
-    do_sse_memcpy<13>,
-    do_sse_memcpy<14>,
-    do_sse_memcpy<15>,
+template <unsigned N, typename loader, typename storer>
+__attribute__((optimize("unroll-loops"), optimize("omit-frame-pointer")))
+void do_sse_memcpy(void* dest, const void* src)
+{
+    do_sse_memcpy_body<N/16, loader, storer>(dest, src);
+    do_sse_memcpy_tail<N % 16, loader, storer>(dest + N/16 * 256, src + N/16 * 256);
+}
+
+struct load_aligned {
+    template <typename register_file, typename datum>
+    void operator()(register_file& rf, const datum* src) { rf.load_aligned(src); }
 };
+
+struct load_unaligned {
+    template <typename register_file, typename datum>
+    void operator()(register_file& rf, const datum* src) { rf.load_unaligned(src); }
+};
+
+struct store_aligned {
+    template <typename register_file, typename datum>
+    void operator()(register_file& rf, datum* dest) { rf.store_aligned(dest); }
+};
+
+struct store_unaligned {
+    template <typename register_file, typename datum>
+    void operator()(register_file& rf, datum* dest) { rf.store_unaligned(dest); }
+};
+
+using static_copier_fn = void (*)(void*, const void*);
+
+template <size_t N>
+struct unaligned_copier {
+    static auto constexpr value = do_sse_memcpy<N, load_unaligned, store_unaligned>;
+};
+
+template <size_t N>
+struct aligned_copier {
+    static auto constexpr value = do_sse_memcpy<N, load_aligned, store_aligned>;
+};
+
+// indices: [is 16-byte aligned][number of 16-byte segments]
+static constexpr std::array<static_copier_fn, 64> sse_memcpy_table[2] = {
+        initialized_array<static_copier_fn, 64, make_index_list<64>, unaligned_copier>(),
+        initialized_array<static_copier_fn, 64, make_index_list<64>, aligned_copier>(),
+};
+
+static bool both_aligned(const void* dest, const void* src, size_t align)
+{
+    return ((reinterpret_cast<uintptr_t>(src)
+        | reinterpret_cast<uintptr_t>(dest)) & (align - 1)) == 0;
+}
 
 static inline void* sse_memcpy(void* dest, const void* src, size_t n)
 {
-    sse_memcpy_table[n/16](dest, src);
+    sse_memcpy_table[both_aligned(dest, src, 16)][n/16](dest, src);
     small_memcpy(dest + (n & ~15), src + (n & ~15), n & 15);
     return dest;
 }
 
 extern "C"
+[[gnu::optimize("omit-frame-pointer")]]
 void *memcpy_repmov_old(void *__restrict dest, const void *__restrict src, size_t n)
 {
     if (n <= 15) {
         return small_memcpy(dest, src, n);
-    } else if (n < 256) {
+    } else if (n < 1024) {
         return sse_memcpy(dest, src, n);
     } else {
         auto ret = dest;
@@ -214,12 +243,54 @@ void *memcpy_repmov_old(void *__restrict dest, const void *__restrict src, size_
 }
 
 extern "C"
+[[gnu::optimize("omit-frame-pointer")]]
 void *memcpy_repmov(void *__restrict dest, const void *__restrict src, size_t n)
 {
     if (n <= 15) {
         return small_memcpy(dest, src, n);
-    } else if (n < 256) {
+    } else if (n < 1024) {
         return sse_memcpy(dest, src, n);
+    } else {
+        auto ret = dest;
+        repmovsb(dest, src, n);
+        return ret;
+    }
+}
+
+extern "C"
+[[gnu::optimize("omit-frame-pointer")]]
+void *memcpy_repmov_old_ssse3(void *__restrict dest, const void *__restrict src, size_t n)
+{
+    if (n <= 15) {
+        return small_memcpy(dest, src, n);
+    } else if (n < 1024) {
+        return sse_memcpy(dest, src, n);
+    } else if (n < 65536 && !both_aligned(dest, src, 16)) {
+        ssse3_unaligned_copy(dest, src, n);
+        return dest;
+    } else {
+        auto ret = dest;
+        auto nw = n / 8;
+        auto nb = n & 7;
+
+        repmovsq(dest, src, nw);
+        repmovsb(dest, src, nb);
+
+        return ret;
+    }
+}
+
+extern "C"
+[[gnu::optimize("omit-frame-pointer")]]
+void *memcpy_repmov_ssse3(void *__restrict dest, const void *__restrict src, size_t n)
+{
+    if (n <= 15) {
+        return small_memcpy(dest, src, n);
+    } else if (n < 1024) {
+        return sse_memcpy(dest, src, n);
+    } else if (n < 65536 && !both_aligned(dest, src, 16)) {
+        ssse3_unaligned_copy(dest, src, n);
+        return dest;
     } else {
         auto ret = dest;
         repmovsb(dest, src, n);
@@ -231,9 +302,18 @@ extern "C"
 void *(*resolve_memcpy())(void *__restrict dest, const void *__restrict src, size_t n)
 {
     if (processor::features().repmovsb) {
-        return memcpy_repmov;
+        if (processor::features().ssse3) {
+            return memcpy_repmov_ssse3;
+        } else {
+            return memcpy_repmov;
+        }
+    } else {
+        if (processor::features().ssse3) {
+            return memcpy_repmov_old_ssse3;
+        } else {
+            return memcpy_repmov_old;
+        }
     }
-    return memcpy_repmov_old;
 }
 
 void *memcpy(void *__restrict dest, const void *__restrict src, size_t n)

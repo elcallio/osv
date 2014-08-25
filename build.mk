@@ -74,6 +74,11 @@ ifeq ($(arch),x64)
 INCLUDES += -isystem $(src)/external/$(arch)/acpica/source/include
 endif
 
+ifeq ($(arch),aarch64)
+libfdt_base = $(src)/external/$(arch)/libfdt
+INCLUDES += -isystem $(libfdt_base)
+endif
+
 INCLUDES += -isystem $(miscbase)/usr/include
 INCLUDES += -isystem $(src)/include/api
 INCLUDES += -isystem $(src)/include/api/$(arch)
@@ -166,7 +171,7 @@ configuration = $(foreach cf,$(configuration-defines), \
 
 include $(src)/conf/base.mk
 include $(src)/conf/$(mode).mk
-include $(src)/conf/$(ARCH).mk
+include $(src)/conf/$(arch).mk
 
 quiet = $(if $V, $1, @echo " $2"; $1)
 very-quiet = $(if $V, $1, @$1)
@@ -349,6 +354,7 @@ tests += tests/tst-pthread-tsd.so
 tests += tests/tst-thread-local.so
 tests += tests/tst-app.so
 tests += tests/misc-gtod.so
+tests += tests/misc-concurrent-io.so
 endif
 
 ifeq ($(arch),aarch64)
@@ -454,6 +460,10 @@ $(acpi): CFLAGS += -fno-strict-aliasing -Wno-strict-aliasing
 endif # x64
 
 ifeq ($(arch),aarch64)
+
+include $(libfdt_base)/Makefile.libfdt
+libfdt-source := $(patsubst %.c, $(libfdt_base)/%.c, $(LIBFDT_SRCS))
+libfdt = $(patsubst $(src)/%.c, %.o, $(libfdt-source))
 
 all: loader.img
 
@@ -776,6 +786,7 @@ drivers += drivers/ramdisk.o
 drivers += core/elf.o
 drivers += java/jvm_balloon.o
 drivers += java/java_api.o
+drivers += java/jni_helpers.o
 drivers += drivers/random.o
 drivers += drivers/zfs.o
 drivers += drivers/null.o
@@ -828,12 +839,17 @@ objects += arch/$(arch)/dump.o
 objects += arch/$(arch)/arch-elf.o
 objects += arch/$(arch)/cpuid.o
 
+
+arch/x64/string-ssse3.o: CXXFLAGS += -mssse3
+
 ifeq ($(arch),aarch64)
 objects += arch/$(arch)/arm-clock.o
 objects += arch/$(arch)/gic.o
+objects += $(libfdt)
 endif
 
 ifeq ($(arch),x64)
+objects += arch/x64/string-ssse3.o
 objects += arch/x64/arch-trace.o
 objects += arch/x64/ioapic.o
 objects += arch/x64/apic.o
@@ -947,6 +963,9 @@ loader.elf: arch/$(arch)/boot.o arch/$(arch)/loader.ld loader.o runtime.o $(driv
 	      $(boost-libs) \
 	    --no-whole-archive, \
 		LD $@)
+
+arch/x64/loader.ld: $(src)/arch/x64/loader.ld.in
+	$(call quiet, cpp -P -I$(src)/include $< > $@, CPP $@)
 
 libosv.so: loader.elf
 	$(call quiet, readelf --dyn-syms loader.elf > osv.syms)

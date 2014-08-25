@@ -117,8 +117,7 @@ namei(const char *path, struct dentry **dpp)
     links_followed = 0;
     strlcpy(fp.get(), path, PATH_MAX);
 
-    need_continue = true;
-    while (need_continue == true) {
+    do {
         need_continue = false;
         /*
          * Convert a full path name to its mount point and
@@ -227,16 +226,7 @@ namei(const char *path, struct dentry **dpp)
                 return ENOTDIR;
             }
         }
-    }
-
-#if 0
-    /*
-     * Detemine X permission.
-     */
-    if (vp->v_type != VDIR && sec_vnode_permission(path) != 0) {
-        vp->v_mode &= ~(0111);
-    }
-#endif
+    } while (need_continue == true);
 
     *dpp = dp;
     return 0;
