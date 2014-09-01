@@ -137,7 +137,9 @@ long syscall(long number, ...)
     SYSCALL2(clock_gettime, clockid_t, struct timespec *);
     SYSCALL2(clock_getres, clockid_t, struct timespec *);
     SYSCALL6(futex, int *, int, int, const struct timespec *, int *, int);
+    SYSCALL1(close, int);
     }
 
     abort("syscall(): unimplemented system call %d. Aborting.\n", number);
 }
+long __syscall(long number, ...)  __attribute__((alias("syscall")));

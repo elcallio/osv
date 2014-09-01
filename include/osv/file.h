@@ -158,8 +158,8 @@ struct file {
 	virtual int stat(struct stat* buf) = 0;
 	virtual int close() = 0;
 	virtual int chmod(mode_t mode) = 0;
-	virtual void epoll_add() {}
-	virtual void epoll_del() {}
+	virtual void epoll_add(epoll_ptr ep);
+	virtual void epoll_del(epoll_ptr ep);
 	virtual void poll_install(pollreq& pr) {}
 	virtual void poll_uninstall(pollreq& pr) {}
 	virtual std::unique_ptr<mmu::file_vma> mmap(addr_range range, unsigned flags, unsigned perm, off_t offset) {
@@ -185,9 +185,6 @@ struct file {
 	                f_poll_list; /* poll request list */
 	mutex_t		f_lock;		/* lock */
 	std::unique_ptr<std::vector<epoll_ptr>> f_epolls;
-	// poll_wake_count used for implementing epoll()'s EPOLLET using poll().
-	// Once we have a real epoll() implementation, it won't be needed.
-	int poll_wake_count = 0;
 	void stop_polls();
 	void wake_epoll(int possible_events = -1);
 };

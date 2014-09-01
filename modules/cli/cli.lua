@@ -2,10 +2,13 @@ require('util')
 require('osv_api')
 require('alt_getopt')
 require('data_dumper')
-commands_path = "commands"
+
+-- Global modules
+cwd = require('cwd')
+context = require('context')
 
 local function command_filename(name)
-  return string.format('%s/%s.lua', commands_path, name)
+  return string.format('%s/%s.lua', context.commands_path, name)
 end
 
 --- Prints message to stderr
@@ -23,6 +26,12 @@ local function print_lua_error(cmd, msg)
   end
 end
 
+--- Returns the prompt
+function prompt()
+  return (cwd.get() .. '# ')
+end
+
+--- Processes a line as a command
 function cli(line)
   local command = trim(line)
   local arguments = ""

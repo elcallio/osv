@@ -145,9 +145,7 @@ inline int net::txq::xmit(mbuf* buff)
 inline bool net::txq::kick_hw()
 {
     bool kicked = vqueue->kick();
-#ifdef DEBUG_VIRTIO_TX
     stats.tx_kicks += !!kicked;
-#endif
 
     return kicked;
 }
@@ -156,11 +154,7 @@ inline void net::txq::kick_pending(u16 thresh)
 {
     if (_pkts_to_kick >= thresh) {
         _pkts_to_kick = 0;
-#ifdef DEBUG_VIRTIO_TX
         stats.tx_worker_kicks += !!kick_hw();
-#else
-        kick_hw();
-#endif
     }
 }
 
@@ -201,31 +195,25 @@ void net::fill_stats(struct if_data* out_data) const
 void net::fill_qstats(const struct rxq& rxq,
                              struct if_data* out_data) const
 {
-    out_data->ifi_ipackets += rxq.stats.rx_packets;
-    out_data->ifi_ibytes   += rxq.stats.rx_bytes;
-    out_data->ifi_iqdrops  += rxq.stats.rx_drops;
-    out_data->ifi_ierrors  += rxq.stats.rx_csum_err;
+    out_data->ifi_ipackets   += rxq.stats.rx_packets;
+    out_data->ifi_ibytes     += rxq.stats.rx_bytes;
+    out_data->ifi_iqdrops    += rxq.stats.rx_drops;
+    out_data->ifi_ierrors    += rxq.stats.rx_csum_err;
+    out_data->ifi_ibh_wakeups = rxq.stats.rx_bh_wakeups;
 }
 
 void net::fill_qstats(const struct txq& txq,
                       struct if_data* out_data) const
 {
     assert(!out_data->ifi_oerrors && !out_data->ifi_obytes && !out_data->ifi_opackets);
-    out_data->ifi_opackets += txq.stats.tx_packets;
-    out_data->ifi_obytes   += txq.stats.tx_bytes;
-    out_data->ifi_oerrors  += txq.stats.tx_err + txq.stats.tx_drops;
-
-#ifdef DEBUG_VIRTIO_TX
-    printf("packet(%d)/kick(%d) %.2f\n",
-           txq.stats.tx_packets, txq.stats.tx_kicks,
-           double(txq.stats.tx_packets)/txq.stats.tx_kicks);
-    printf("worker packet(%d)/worker_kick(%d) %.2f\n",
-           txq.stats.tx_worker_packets, txq.stats.tx_worker_kicks,
-           double(txq.stats.tx_worker_packets)/txq.stats.tx_worker_kicks);
-    printf("worker packet(%d)/worker wakeup(%d) %.2f\n",
-           txq.stats.tx_worker_packets, txq.stats.tx_worker_wakeups,
-           double(txq.stats.tx_worker_packets)/txq.stats.tx_worker_wakeups);
-#endif
+    out_data->ifi_opackets       += txq.stats.tx_packets;
+    out_data->ifi_obytes         += txq.stats.tx_bytes;
+    out_data->ifi_oerrors        += txq.stats.tx_err + txq.stats.tx_drops;
+    out_data->ifi_oworker_kicks   = txq.stats.tx_worker_kicks;
+    out_data->ifi_oworker_wakeups = txq.stats.tx_worker_wakeups;
+    out_data->ifi_oworker_packets = txq.stats.tx_worker_packets;
+    out_data->ifi_okicks          = txq.stats.tx_kicks;
+    out_data->ifi_oqueue_is_full  = txq.stats.tx_hw_queue_is_full;
 }
 
 bool net::ack_irq()
@@ -434,6 +422,8 @@ void net::receiver()
         // Wait for rx queue (used elements)
         virtio_driver::wait_for_queue(vq, &vring::used_ring_not_empty);
         trace_virtio_net_rx_wake();
+
+        _rxq.stats.rx_bh_wakeups++;
 
         u32 len;
         int nbufs;
@@ -657,9 +647,11 @@ int net::txq::try_xmit_one_locked(net_req* req)
             trace_virtio_net_tx_no_space_calling_gc(_parent->_ifn->if_index);
             gc();
             if (!vqueue->avail_ring_has_room(vec_sz)) {
+                req->hw_queue_was_full = 1;
                 return ENOBUFS;
             }
         } else {
+            req->hw_queue_was_full = 1;
             return ENOBUFS;
         }
     } else {
@@ -676,6 +668,7 @@ int net::txq::try_xmit_one_locked(net_req* req)
 inline void net::txq::update_stats(net_req* req)
 {
     stats.tx_bytes += req->tx_bytes;
+    stats.tx_hw_queue_is_full += req->hw_queue_was_full;
     stats.tx_packets++;
 
     if (req->mhdr.hdr.flags & net_hdr::VIRTIO_NET_HDR_F_NEEDS_CSUM)
@@ -691,8 +684,7 @@ void net::txq::xmit_one_locked(void* _req)
     net_req* req = static_cast<net_req*>(_req);
 
     if (try_xmit_one_locked(req)) {
-        trace_virtio_net_tx_xmit_one_failed_to_post(vqueue,
-                                                    vqueue->_sg_vec.size());
+
         // We are going to poll - flush the pending packets
         kick_pending();
         do {
@@ -716,9 +708,7 @@ void net::txq::xmit_one_locked(void* _req)
     //
     _pkts_to_kick++;
 
-#ifdef DEBUG_VIRTIO_TX
     stats.tx_worker_packets++;
-#endif
 }
 
 mbuf* net::txq::offload(mbuf* m, net_hdr* hdr)

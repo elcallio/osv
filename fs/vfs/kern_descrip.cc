@@ -14,6 +14,7 @@
 #include <osv/debug.h>
 #include <osv/mutex.h>
 #include <osv/rcu.hh>
+#include <boost/range/algorithm/find.hpp>
 
 #include <bsd/sys/sys/queue.h>
 
@@ -185,16 +186,27 @@ void fhold(struct file* fp)
 
 int fdrop(struct file *fp)
 {
-    if (__sync_fetch_and_sub(&fp->f_count, 1) != 1)
+    int o = fp->f_count, n;
+    bool do_free;
+    do {
+        n = o - 1;
+        if (n == 0) {
+            /* We are about to free this file structure, but we still do things with it
+             * so set the refcount to INT_MIN, fhold/fdrop may get called again
+             * and we don't want to reach this point more than once.
+             * INT_MIN is also safe against fget() seeing this file.
+             */
+            n = INT_MIN;
+            do_free = true;
+        } else {
+            do_free = false;
+        }
+    } while (!__atomic_compare_exchange_n(&fp->f_count, &o, n, true,
+                __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    if (!do_free)
         return 0;
 
-    /* We are about to free this file structure, but we still do things with it
-     * so set the refcount to INT_MIN, fhold/fdrop may get called again
-     * and we don't want to reach this point more than once.
-     * INT_MIN is also safe against fget() seeing this file.
-     */
-
-    fp->f_count = INT_MIN;
     fp->stop_polls();
     fp->close();
     rcu_dispose(fp);
@@ -213,6 +225,29 @@ void file::stop_polls()
     if (f_epolls) {
         for (auto ep : *f_epolls) {
             epoll_file_closed(ep);
+        }
+    }
+}
+
+void file::epoll_add(epoll_ptr ep)
+{
+    WITH_LOCK(f_lock) {
+        if (!f_epolls) {
+            f_epolls.reset(new std::vector<epoll_ptr>);
+        }
+        if (boost::range::find(*f_epolls, ep) == f_epolls->end()) {
+            f_epolls->push_back(ep);
+        }
+    }
+}
+
+void file::epoll_del(epoll_ptr ep)
+{
+    WITH_LOCK(f_lock) {
+        assert(f_epolls);
+        auto i = boost::range::find(*f_epolls, ep);
+        if (i != f_epolls->end()) {
+            f_epolls->erase(i);
         }
     }
 }

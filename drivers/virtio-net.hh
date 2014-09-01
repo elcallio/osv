@@ -8,8 +8,6 @@
 #ifndef VIRTIO_NET_DRIVER_H
 #define VIRTIO_NET_DRIVER_H
 
-//#define DEBUG_VIRTIO_TX
-
 #include <bsd/porting/netport.h>
 #include <bsd/sys/net/if_var.h>
 #include <bsd/sys/net/if.h>
@@ -247,13 +245,14 @@ public:
 private:
 
     struct net_req {
-        explicit net_req(mbuf *m) : mb(m) {
+        explicit net_req(mbuf *m) : mb(m), hw_queue_was_full(0) {
             memset(&mhdr, 0, sizeof(mhdr));
         }
 
         struct net::net_hdr_mrg_rxbuf mhdr;
         mbuf* mb;
         u64 tx_bytes;
+        int hw_queue_was_full;
     };
 
     std::string _driver_name;
@@ -278,6 +277,7 @@ private:
         u64 rx_drops;   /* if_iqdrops */
         u64 rx_csum;    /* number of packets with correct csum */
         u64 rx_csum_err;/* number of packets with a bad checksum */
+        u64 rx_bh_wakeups;
     };
 
     struct txq_stats {
@@ -288,12 +288,11 @@ private:
         u64 tx_csum;    /* CSUM offload requests */
         u64 tx_tso;     /* GSO/TSO packets */
         /* u64 tx_rescheduled; */ /* TODO when we implement xoff */
-#ifdef DEBUG_VIRTIO_TX
         u64 tx_worker_kicks;
         u64 tx_kicks;
         u64 tx_worker_wakeups;
         u64 tx_worker_packets;
-#endif
+        u64 tx_hw_queue_is_full;
     };
 
      /* Single Rx queue object */

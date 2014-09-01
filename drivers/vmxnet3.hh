@@ -181,6 +181,10 @@ public:
         u64 tx_csum;    /* CSUM offload requests */
         u64 tx_tso;     /* GSO/TSO packets */
         /* u64 tx_rescheduled; */ /* TODO when we implement xoff */
+        u64 tx_worker_kicks;
+        u64 tx_kicks;
+        u64 tx_worker_wakeups;
+        u64 tx_worker_packets;
     } stats = { 0 };
     sched::thread task;
 
